@@ -5,6 +5,7 @@ import { initializeDashboard } from "../app.js";
 const navigation = [
   ["Overview Dashboard", "◫"],
   ["Live Bus Monitoring", "⌖", "12"],
+  ["Computer Vision Monitoring", "📷", "YOLO"],
   ["Mismatch Alerts", "⚑", "4"],
   ["Bus & Route Management", "▤"],
   ["Passenger Analytics", "⌁"],

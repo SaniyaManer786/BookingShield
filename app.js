@@ -1,5 +1,6 @@
-/* SMART ST is a frontend-only demonstration. All records below are mock data. */
-const pageNames = ["Overview Dashboard","Live Bus Monitoring","Mismatch Alerts","Bus & Route Management","Passenger Analytics","Checker Dispatch","Inspection History","Reports & Analytics","Settings"];
+import { renderComputerVision, wireComputerVisionControls } from "./src/computerVision.js";
+/* SMART ST Control Center fleet monitoring and inspection dashboard. */
+const pageNames = ["Overview Dashboard","Live Bus Monitoring","Computer Vision Monitoring","Mismatch Alerts","Bus & Route Management","Passenger Analytics","Checker Dispatch","Inspection History","Reports & Analytics","Settings"];
 const routes = ["Pune – Mumbai","Pune – Nashik","Pune – Kolhapur","Pune – Satara","Pune – Solapur","Mumbai – Nashik"];
 const buses = [
   {id:"MH-12-QW-4821",fleet:"ST-1042",route:routes[0],depot:"Swargate",capacity:52,operator:"A. Jadhav",passengers:46,tickets:44,mismatch:2,occupancy:88,status:"Mismatch Detected",stop:"Lonavala",next:"Khandala",updated:"2 min ago"},
@@ -71,7 +72,7 @@ function renderDashboard(){
 }
 
 function renderLive(){
- return `${title("Live Bus Monitoring","Monitor active buses, route activity, and passenger–ticket variance.",'<button class="btn" data-action="refresh">↻ Refresh</button>')}
+ return `${title("Live Bus Monitoring","Monitor active buses, route activity, and passenger–ticket variance.",'<button class="btn btn-primary" data-goto="Computer Vision Monitoring">📷 Computer Vision Camera</button><button class="btn" data-action="refresh">↻ Refresh</button>')}
  <div class="kpi-grid">${kpi("Active on routes","248","▣","Across 18 routes")}${kpi("Normal status","214","✓","86% of active fleet","teal")}${kpi("Mismatch detected","26","⚑","8 need immediate attention","red")}${kpi("Inspection pending","08","◷","Checkers en route","amber")}</div>
  <div class="toolbar"><input id="busSearch" placeholder="Search bus number or route..." aria-label="Search buses" value="${esc(globalQuery)}" /><select id="busStatusFilter" aria-label="Filter by bus status"><option value="">All statuses</option><option>Normal</option><option>Mismatch Detected</option><option>Inspection Pending</option></select><select id="busRouteFilter" aria-label="Filter by route"><option value="">All routes</option>${routes.map(r=>`<option>${esc(r)}</option>`).join("")}</select><span class="toolbar-spacer"></span><span class="mini-pill">Positions are illustrative · no live GPS</span></div>
  <div class="monitor-layout"><section class="panel"><div class="panel-heading"><div><h2>Fleet activity</h2><div class="panel-subtitle">Select a bus to inspect its sample activity</div></div><span class="mini-pill" id="busResultCount">${buses.length} buses</span></div><div id="liveBusTable">${busTable(filterBuses(),false)}</div></section><section class="panel"><div class="panel-heading"><div><h2>Route map</h2><div class="panel-subtitle">Schematic view · sample bus markers</div></div><span class="mini-pill">Maharashtra</span></div><div class="map-card"><div class="map-grid"></div><div class="map-river"></div><i class="map-road road-one"></i><i class="map-road road-two"></i><span class="map-label mumbai">Mumbai</span><span class="map-label pune">Pune</span><span class="map-label nashik">Nashik</span><span class="map-label kolhapur">Kolhapur</span><button class="map-marker m1 warn" data-action="bus-detail" data-id="${esc(buses[0].id)}" aria-label="Open bus ${esc(buses[0].id)}"><span>1</span></button><button class="map-marker m2" data-action="bus-detail" data-id="${esc(buses[1].id)}" aria-label="Open bus ${esc(buses[1].id)}"><span>2</span></button><button class="map-marker m3 warn" data-action="bus-detail" data-id="${esc(buses[2].id)}" aria-label="Open bus ${esc(buses[2].id)}"><span>3</span></button><button class="map-marker m4" data-action="bus-detail" data-id="${esc(buses[5].id)}" aria-label="Open bus ${esc(buses[5].id)}"><span>4</span></button><div class="map-caption">Visual mockup · markers do not indicate real bus locations</div></div><div class="detail-list"><div><span>Visible routes</span><strong>6 corridors</strong></div><div><span>Fleet capacity in sample</span><strong>52 seats per bus</strong></div></div></section></div>`;
@@ -149,11 +150,12 @@ function settingsSelect(key,options){return `<select class="form-control" data-s
 
 function render(){
  const content=$("#pageContent");
- const renderers={"Overview Dashboard":renderDashboard,"Live Bus Monitoring":renderLive,"Mismatch Alerts":renderAlerts,"Bus & Route Management":renderManagement,"Passenger Analytics":renderAnalytics,"Checker Dispatch":renderDispatch,"Inspection History":renderHistory,"Reports & Analytics":renderReports,"Settings":renderSettings};
+ const renderers={"Overview Dashboard":renderDashboard,"Live Bus Monitoring":renderLive,"Computer Vision Monitoring":renderComputerVision,"Mismatch Alerts":renderAlerts,"Bus & Route Management":renderManagement,"Passenger Analytics":renderAnalytics,"Checker Dispatch":renderDispatch,"Inspection History":renderHistory,"Reports & Analytics":renderReports,"Settings":renderSettings};
  content.innerHTML=(renderers[currentPage]||renderDashboard)();
  $("#breadcrumbTitle").textContent=currentPage;
  if(currentPage==="Bus & Route Management")managementRows();
  if(currentPage==="Inspection History")historyRows();
+ if(currentPage==="Computer Vision Monitoring")wireComputerVisionControls();
  wirePageControls();
  wireSettings();
 }
@@ -174,7 +176,19 @@ function wireSettings(){
  $("#adminEmail")?.addEventListener("input",e=>{settings.adminEmail=e.target.value});
  applySettings();
 }
-function gotoPage(name){if(!pageNames.includes(name))return;currentPage=name;globalQuery="";$("#globalSearch").value="";document.querySelectorAll(".nav-link").forEach(b=>b.classList.toggle("active",b.dataset.page===name));document.body.classList.remove("sidebar-open");render();window.scrollTo({top:0,behavior:"smooth"});}
+function gotoPage(name){
+ if(!pageNames.includes(name))return;
+ if(currentPage==="Computer Vision Monitoring" && window.__stopVisionMonitoring){
+   window.__stopVisionMonitoring();
+ }
+ currentPage=name;
+ globalQuery="";
+ $("#globalSearch").value="";
+ document.querySelectorAll(".nav-link").forEach(b=>b.classList.toggle("active",b.dataset.page===name));
+ document.body.classList.remove("sidebar-open");
+ render();
+ window.scrollTo({top:0,behavior:"smooth"});
+}
 function toast(message){const root=$("#toastRoot"),el=document.createElement("div");el.className="toast";el.textContent=message;root.append(el);setTimeout(()=>el.remove(),3200);}
 function openModal(headline,sub,body,footer=""){
  $("#modalRoot").innerHTML=`<div class="modal-backdrop" data-close-backdrop><section class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle"><header class="modal-header"><div><h2 id="modalTitle">${headline}</h2><p>${sub}</p></div><button class="modal-close" aria-label="Close dialog" data-action="close-modal">×</button></header><div class="modal-body">${body}</div>${footer?`<footer class="modal-footer">${footer}</footer>`:""}</section></div>`;
