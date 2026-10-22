@@ -6,6 +6,7 @@ const navigation = [
   ["Overview Dashboard", "◫"],
   ["Live Bus Monitoring", "⌖", "12"],
   ["Computer Vision Monitoring", "📷", "YOLO"],
+  ["Conductor Panel", "🎫", "Active"],
   ["Mismatch Alerts", "⚑", "4"],
   ["Bus & Route Management", "▤"],
   ["Passenger Analytics", "⌁"],

@@ -1,6 +1,7 @@
 import { renderComputerVision, wireComputerVisionControls } from "./src/computerVision.js";
+import { renderConductorPanel, wireConductorPanelControls, cleanupConductorPanel } from "./src/conductorPanel.js";
 /* SMART ST Control Center fleet monitoring and inspection dashboard. */
-const pageNames = ["Overview Dashboard","Live Bus Monitoring","Computer Vision Monitoring","Mismatch Alerts","Bus & Route Management","Passenger Analytics","Checker Dispatch","Inspection History","Reports & Analytics","Settings"];
+const pageNames = ["Overview Dashboard","Live Bus Monitoring","Computer Vision Monitoring","Conductor Panel","Mismatch Alerts","Bus & Route Management","Passenger Analytics","Checker Dispatch","Inspection History","Reports & Analytics","Settings"];
 const routes = ["Pune – Mumbai","Pune – Nashik","Pune – Kolhapur","Pune – Satara","Pune – Solapur","Mumbai – Nashik"];
 const buses = [
   {id:"MH-12-QW-4821",fleet:"ST-1042",route:routes[0],depot:"Swargate",capacity:52,operator:"A. Jadhav",passengers:46,tickets:44,mismatch:2,occupancy:88,status:"Mismatch Detected",stop:"Lonavala",next:"Khandala",updated:"2 min ago"},
@@ -150,12 +151,13 @@ function settingsSelect(key,options){return `<select class="form-control" data-s
 
 function render(){
  const content=$("#pageContent");
- const renderers={"Overview Dashboard":renderDashboard,"Live Bus Monitoring":renderLive,"Computer Vision Monitoring":renderComputerVision,"Mismatch Alerts":renderAlerts,"Bus & Route Management":renderManagement,"Passenger Analytics":renderAnalytics,"Checker Dispatch":renderDispatch,"Inspection History":renderHistory,"Reports & Analytics":renderReports,"Settings":renderSettings};
+ const renderers={"Overview Dashboard":renderDashboard,"Live Bus Monitoring":renderLive,"Computer Vision Monitoring":renderComputerVision,"Conductor Panel":renderConductorPanel,"Mismatch Alerts":renderAlerts,"Bus & Route Management":renderManagement,"Passenger Analytics":renderAnalytics,"Checker Dispatch":renderDispatch,"Inspection History":renderHistory,"Reports & Analytics":renderReports,"Settings":renderSettings};
  content.innerHTML=(renderers[currentPage]||renderDashboard)();
  $("#breadcrumbTitle").textContent=currentPage;
  if(currentPage==="Bus & Route Management")managementRows();
  if(currentPage==="Inspection History")historyRows();
  if(currentPage==="Computer Vision Monitoring")wireComputerVisionControls();
+ if(currentPage==="Conductor Panel")wireConductorPanelControls();
  wirePageControls();
  wireSettings();
 }
@@ -180,6 +182,9 @@ function gotoPage(name){
  if(!pageNames.includes(name))return;
  if(currentPage==="Computer Vision Monitoring" && window.__stopVisionMonitoring){
    window.__stopVisionMonitoring();
+ }
+ if(currentPage==="Conductor Panel" && window.__stopConductorPolling){
+   window.__stopConductorPolling();
  }
  currentPage=name;
  globalQuery="";

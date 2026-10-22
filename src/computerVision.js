@@ -251,11 +251,13 @@ async function processVideoFrame() {
     const base64Jpeg = offscreen.toDataURL("image/jpeg", 0.75);
 
     // Send to backend (confidence threshold is handled on backend)
+    const activeBusId = window.__activeMonitoringBusId || "MH-12-QW-4821";
     const res = await fetch("/api/detect", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        image: base64Jpeg
+        image: base64Jpeg,
+        bus_id: activeBusId
       })
     });
 
@@ -617,6 +619,11 @@ export function renderComputerVision() {
           </button>
           <button class="btn" id="cvRestartBtn" disabled>
             ↻ Restart Camera
+          </button>
+        </div>
+        <div class="cv-controls-right">
+          <button class="btn" data-goto="Conductor Panel">
+            🎫 Conductor Panel →
           </button>
         </div>
       </div>
