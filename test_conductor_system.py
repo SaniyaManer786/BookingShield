@@ -482,6 +482,32 @@ class TestConductorPanelSystem(unittest.TestCase):
         not_found = self.client.get("/api/conductor/checkpoints/99999999")
         self.assertEqual(not_found.status_code, 404)
 
+    def test_14_reset_tracker_then_tracked_detection_survives(self):
+        """
+        Regression: resetting the tracker must not break the next tracked frame.
+
+        /api/reset-tracker used to leave predictor.trackers as an empty list,
+        which made ultralytics skip re-initialisation and then raise
+        "list index out of range" on the next /api/detect call.
+        """
+        sample = self.client.get("/api/sample-frame").json()["image"]
+
+        # Warm up tracking so the predictor owns tracker state.
+        first = self.client.post("/api/detect", json={
+            "image": sample, "track": True, "bus_id": "MH-09-CV-3372"
+        })
+        self.assertEqual(first.status_code, 200, first.text)
+
+        reset = self.client.post("/api/reset-tracker")
+        self.assertEqual(reset.status_code, 200)
+
+        for _ in range(3):
+            res = self.client.post("/api/detect", json={
+                "image": sample, "track": True, "bus_id": "MH-09-CV-3372"
+            })
+            self.assertEqual(res.status_code, 200, res.text)
+            self.assertGreaterEqual(res.json()["count"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

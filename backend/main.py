@@ -8,7 +8,7 @@ import sys
 import time
 import base64
 import logging
-from typing import List, Optional, Any
+from typing import List, Optional, Any, Dict
 from datetime import datetime, timezone
 
 try:
@@ -20,10 +20,6 @@ try:
     import cv2
 except ImportError:
     cv2 = None
-
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, StrictInt
 
 # Configure logging
 logging.basicConfig(
@@ -38,31 +34,82 @@ try:
     env_paths = [
         os.path.join(os.path.dirname(__file__), "..", ".env"),
         os.path.join(os.path.dirname(__file__), ".env"),
-        ".env"
     ]
-    for p in env_paths:
-        if os.path.exists(p):
-            load_dotenv(p)
+    for ep in env_paths:
+        if os.path.exists(ep):
+            load_dotenv(ep)
             break
-except ImportError:
+except Exception:
     pass
 
-# Documented backend default confidence threshold for YOLO person detection
-DEFAULT_YOLO_CONFIDENCE_THRESHOLD: float = 0.70
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, StrictInt, model_validator
 
+# Local imports
 try:
-    from backend import conductor_db
-except ImportError:
+    from . import conductor_db
+    from . import alert_dispatch
+except Exception:
     import conductor_db
+    import alert_dispatch
 
+# Initialize FastAPI app
+app = FastAPI(
+    title="SMART ST Vision API",
+    description="Browser camera frame inference for real-time person detection & passenger monitoring using YOLO and OpenCV",
+    version="1.0.0"
+)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc):
+    errors = exc.errors()
+    if request.url.path.startswith("/api/conductor/checkpoint"):
+        for err in errors:
+            msg = str(err.get("msg", ""))
+            if "negative expected occupancy" in msg.lower():
+                return JSONResponse(status_code=400, content={"detail": "Movement entry would produce negative expected occupancy (startingOnboard + boarded - alighted < 0)."})
+            if "cannot be negative" in msg.lower():
+                return JSONResponse(status_code=400, content={"detail": msg.replace("Value error, ", "")})
+            if "whole integer" in msg.lower():
+                return JSONResponse(status_code=400, content={"detail": msg.replace("Value error, ", "")})
+            if "current checkpoint is required" in msg.lower():
+                return JSONResponse(status_code=400, content={"detail": "Current checkpoint is required."})
+        return JSONResponse(status_code=400, content={"detail": errors[0].get("msg", "Validation error").replace("Value error, ", "")})
+    return JSONResponse(status_code=422, content={"detail": errors})
+
+
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:8000",
+        "http://localhost:8001",
+        "http://127.0.0.1:8001",
+        "*"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Global model state
+yolo_model = None
+model_device = "cpu"
+model_name = "YOLOv8n"
+MODEL_PATH = os.environ.get("YOLO_MODEL_PATH", "yolov8n.pt")
+
+DEFAULT_YOLO_CONFIDENCE_THRESHOLD = 0.70
 
 
 def get_yolo_confidence_threshold() -> float:
-    """
-    Reads and validates the YOLO confidence threshold from the environment variable
-    YOLO_CONFIDENCE_THRESHOLD. Valid range: 0.01 to 0.99.
-    Falls back to documented backend default (0.70) if not set or invalid.
-    """
     raw = os.environ.get("YOLO_CONFIDENCE_THRESHOLD")
     if raw is None or raw.strip() == "":
         return DEFAULT_YOLO_CONFIDENCE_THRESHOLD
@@ -83,38 +130,7 @@ def get_yolo_confidence_threshold() -> float:
         return DEFAULT_YOLO_CONFIDENCE_THRESHOLD
 
 
-# Initialize FastAPI app
-app = FastAPI(
-    title="SMART ST Vision API",
-    description="Browser camera frame inference for real-time person detection & passenger monitoring using YOLO and OpenCV",
-    version="1.0.0"
-)
-
-# Configure CORS for Vite development server (localhost:5173) and any local network access
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:8000",
-        "*"
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Global model state
-yolo_model = None
-model_device = "cpu"
-model_name = "YOLOv8n"
-MODEL_PATH = os.environ.get("YOLO_MODEL_PATH", "yolov8n.pt")
-
-
 def find_model_path():
-    """Finds yolov8n.pt in common locations."""
     candidates = [
         MODEL_PATH,
         os.path.join(os.path.dirname(__file__), "yolov8n.pt"),
@@ -125,11 +141,10 @@ def find_model_path():
     for path in candidates:
         if path and os.path.exists(path):
             return os.path.abspath(path)
-    return "yolov8n.pt"  # Will fallback to ultralytics download/cache if not found locally
+    return "yolov8n.pt"
 
 
 def load_model():
-    """Loads the pretrained YOLO model with error handling and warmup."""
     global yolo_model, model_device
     try:
         from ultralytics import YOLO
@@ -138,17 +153,13 @@ def load_model():
         model_device = "cuda" if torch.cuda.is_available() else "cpu"
         model_file = find_model_path()
         logger.info(f"Loading YOLO model from '{model_file}' on device '{model_device}'...")
-
         yolo_model = YOLO(model_file)
-        
-        # Warmup model with a dummy blank image using configured confidence
         active_conf = get_yolo_confidence_threshold()
         if np is not None:
             warmup_img = np.zeros((320, 320, 3), dtype=np.uint8)
             yolo_model(warmup_img, classes=[0], conf=active_conf, verbose=False)
         logger.info(
-            f"YOLO model successfully loaded and warmed up! "
-            f"Target class: Person (ID 0). Backend confidence threshold: {active_conf}."
+            f"YOLO model successfully loaded and warmed up! Target class: Person (ID 0). Backend confidence threshold: {active_conf}."
         )
     except Exception as e:
         logger.error(f"Failed to load YOLO model: {e}")
@@ -161,10 +172,20 @@ async def startup_event():
         conductor_db.init_db()
     except Exception as e:
         logger.error(f"Error initializing conductor database: {e}")
-    load_model()
+    try:
+        alert_dispatch.init_db()
+    except Exception as e:
+        logger.error(f"Error initializing mismatch alert database: {e}")
+    try:
+        load_model()
+    except Exception as e:
+        logger.error(f"Error loading model: {e}")
 
 
-# Pydantic Schemas
+# ---------------------------------------------------------------------------
+# Detection schemas and endpoints (real YOLO/OpenCV person inference)
+# ---------------------------------------------------------------------------
+
 class BoundingBox(BaseModel):
     box: List[float] = Field(..., description="[x1, y1, x2, y2] bounding box coordinates")
     x1: float = Field(..., description="Top-left X coordinate in pixels")
@@ -183,8 +204,8 @@ class DetectionRequest(BaseModel):
     image: str = Field(..., description="Base64 encoded JPEG/PNG frame or data URL")
     track: bool = Field(False, description="Enable object tracking for persistent IDs")
     iou: float = Field(0.45, ge=0.1, le=0.95, description="Non-maximum suppression IOU threshold")
-    # Note: confidence is backend-controlled via YOLO_CONFIDENCE_THRESHOLD and cannot be overridden by request parameters
-    confidence: Optional[float] = Field(None, description="Ignored: Backend controls threshold via YOLO_CONFIDENCE_THRESHOLD")
+    # Confidence is intentionally backend-controlled via YOLO_CONFIDENCE_THRESHOLD.
+    confidence: Optional[float] = Field(None, description="Ignored: backend controls threshold via YOLO_CONFIDENCE_THRESHOLD")
     bus_id: Optional[str] = Field("MH-12-QW-4821", description="Associated bus registration ID")
 
 
@@ -201,6 +222,14 @@ class DetectionResponse(BaseModel):
     device: str
 
 
+class VisionSessionRequest(BaseModel):
+    bus_id: Optional[str] = Field("MH-12-QW-4821", max_length=50)
+    camera_status: str = Field("idle", max_length=50)
+    model_status: str = Field("unknown", max_length=50)
+    message: str = Field("", max_length=500)
+    session_id: str = Field("", max_length=100)
+
+
 @app.get("/")
 def index():
     return {
@@ -213,14 +242,25 @@ def index():
 
 
 @app.get("/api/health")
+@app.get("/health")
 def health_check():
     """Returns the service health status, model readiness, compute device, and backend confidence threshold."""
     global yolo_model
     if yolo_model is None:
         load_model()
+    db_ok = True
+    try:
+        conn = conductor_db.get_db_connection()
+        conn.execute("SELECT 1 FROM checkpoint_submissions LIMIT 1")
+        conn.close()
+    except Exception as e:
+        logger.error(f"Health check database error: {e}")
+        db_ok = False
     return {
-        "status": "healthy" if yolo_model is not None else "degraded",
+        "status": "healthy" if (yolo_model is not None and db_ok) else "degraded",
         "model_loaded": yolo_model is not None,
+        "database_ok": db_ok,
+        "database_path": conductor_db.DB_PATH,
         "model_name": model_name,
         "device": model_device,
         "confidence_threshold": get_yolo_confidence_threshold(),
@@ -237,7 +277,7 @@ def get_sample_frame():
     if os.path.exists(asset_path):
         with open(asset_path, "rb") as f:
             b64 = "data:image/jpeg;base64," + base64.b64encode(f.read()).decode("utf-8")
-        return {"success": True, "image": b64, "name": "COCO bus.jpg (3 passengers visible)"}
+        return {"success": True, "image": b64, "name": "COCO bus.jpg (people visible)"}
     return {"success": False, "image": None}
 
 
@@ -264,10 +304,16 @@ def decode_base64_image(image_str: str) -> Any:
 @app.post("/api/detect", response_model=DetectionResponse)
 def detect_people(payload: DetectionRequest):
     """
-    Primary real-time detection endpoint.
-    Receives camera frame from browser, decodes with OpenCV,
-    and runs YOLO inference filtering exclusively for the COCO person class (0).
-    Confidence threshold is strictly backend-configured (cannot be overridden by frontend).
+    Real-time detection endpoint.
+
+    Receives a camera frame from the browser, decodes it with OpenCV, and runs
+    YOLO inference filtered to the COCO person class (0). The confidence
+    threshold is backend-configured.
+
+    When tracking is enabled, ByteTrack assigns a persistent ID to each person
+    and the response de-duplicates repeated boxes for the same track. The count
+    is always the number of people visible in the current frame, so a person is
+    never counted twice just because they stay in view.
     """
     global yolo_model
     if yolo_model is None:
@@ -284,7 +330,7 @@ def detect_people(payload: DetectionRequest):
     img = decode_base64_image(payload.image)
     h, w = img.shape[:2]
 
-    # Step 2: Run YOLO inference for COCO person class (0) using backend confidence threshold
+    # Step 2: Run YOLO inference for COCO person class (0)
     conf_threshold = get_yolo_confidence_threshold()
     t_inf_start = time.perf_counter()
     try:
@@ -307,13 +353,38 @@ def detect_people(payload: DetectionRequest):
                 verbose=False
             )
     except Exception as e:
-        logger.error(f"Inference error: {e}")
-        raise HTTPException(status_code=500, detail=f"Inference failed: {str(e)}")
+        if not payload.track:
+            logger.error(f"Inference error: {e}")
+            raise HTTPException(status_code=500, detail=f"Inference failed: {str(e)}")
+
+        # Tracker state can become inconsistent (after a reset, a resolution
+        # change or a dropped frame). Drop the state and retry this single
+        # frame as plain detection so the camera stream never dies with a 500.
+        logger.warning(f"Tracking failed ({e}); retrying this frame without tracking.")
+        predictor = getattr(yolo_model, "predictor", None)
+        if predictor is not None:
+            predictor.__dict__.pop("trackers", None)
+            predictor.__dict__.pop("vid_path", None)
+        try:
+            results = yolo_model(
+                img,
+                classes=[0],
+                conf=conf_threshold,
+                iou=payload.iou,
+                verbose=False
+            )
+        except Exception as retry_error:
+            logger.error(f"Inference error after tracking fallback: {retry_error}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Inference failed: {str(retry_error)}"
+            )
 
     inference_time_ms = round((time.perf_counter() - t_inf_start) * 1000, 2)
 
-    # Step 3: Extract structured bounding boxes
+    # Step 3: Extract structured bounding boxes (de-duplicated by track id)
     detections: List[BoundingBox] = []
+    seen_track_ids = set()
     if len(results) > 0 and results[0].boxes is not None:
         boxes = results[0].boxes
         for box in boxes:
@@ -322,6 +393,11 @@ def detect_people(payload: DetectionRequest):
             conf = float(box.conf[0].cpu().numpy())
             cls_id = int(box.cls[0].cpu().numpy())
             track_id = int(box.id[0].cpu().numpy()) if (payload.track and box.id is not None) else None
+
+            if track_id is not None:
+                if track_id in seen_track_ids:
+                    continue
+                seen_track_ids.add(track_id)
 
             # Enforce bounds
             x1 = max(0.0, min(float(w), x1))
@@ -345,7 +421,8 @@ def detect_people(payload: DetectionRequest):
 
     total_processing_ms = round((time.perf_counter() - t0) * 1000, 2)
 
-    # Record latest detection in persistent storage for conductor comparison
+    # Step 4: Persist the latest detection for the active bus so the Conductor
+    # Panel always reads the same real count from the backend.
     try:
         conductor_db.record_latest_detection(
             bus_id=payload.bus_id or "MH-12-QW-4821",
@@ -388,17 +465,69 @@ async def detect_people_form(
 
 @app.post("/api/reset-tracker")
 def reset_tracker():
-    """Resets the tracker states so new tracking sessions start with fresh IDs."""
+    """Resets tracker state so a new camera session starts with fresh track IDs."""
     global yolo_model
-    if yolo_model is not None and hasattr(yolo_model, "predictor") and yolo_model.predictor is not None:
-        if hasattr(yolo_model.predictor, "trackers"):
-            yolo_model.predictor.trackers = []
+    if yolo_model is None:
+        return {"success": True, "message": "Tracker history cleared"}
+
+    predictor = getattr(yolo_model, "predictor", None)
+    if predictor is not None:
+        for tracker in getattr(predictor, "trackers", None) or []:
+            reset = getattr(tracker, "reset", None)
+            if callable(reset):
+                try:
+                    reset()
+                except Exception:
+                    pass
+        # Remove the tracker slots entirely so ultralytics rebuilds them on the
+        # next tracking call. An empty list is NOT safe: on_predict_start treats
+        # the attribute as already initialised and on_predict_postprocess_end
+        # then indexes trackers[0], raising "list index out of range".
+        predictor.__dict__.pop("trackers", None)
+        predictor.__dict__.pop("vid_path", None)
+
     return {"success": True, "message": "Tracker history cleared"}
 
 
-# =====================================================================
-# Conductor Panel Models and Endpoints
-# =====================================================================
+@app.post("/api/vision/session")
+def record_vision_session(payload: VisionSessionRequest):
+    """Stores the real browser camera/model status reported by the monitoring page."""
+    bus_id = (payload.bus_id or "").strip()
+    if not bus_id:
+        raise HTTPException(status_code=400, detail="bus_id is required.")
+    try:
+        saved = conductor_db.record_camera_session(
+            bus_id=bus_id,
+            camera_status=payload.camera_status,
+            model_status=payload.model_status,
+            message=payload.message,
+            session_id=payload.session_id
+        )
+        return {"success": True, **saved}
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Error recording camera session: {e}")
+        raise HTTPException(status_code=500, detail="Failed to record camera session.")
+
+
+@app.get("/api/conductor/camera-state")
+def get_conductor_camera_state(bus_id: Optional[str] = None, bus: Optional[str] = None):
+    """
+    Returns the shared camera state and latest real YOLO passenger count.
+
+    The Conductor Panel polls this endpoint; a missing count is returned as
+    unavailable instead of being replaced with a hardcoded value.
+    """
+    target_bus = (bus_id or bus or "MH-12-QW-4821").strip()
+    if not target_bus:
+        raise HTTPException(status_code=400, detail="bus_id is required.")
+    camera_state = conductor_db.get_camera_state(
+        target_bus,
+        model_available=yolo_model is not None
+    )
+    return {"success": True, **camera_state}
+
 
 class ConductorCountRequest(BaseModel):
     bus_id: str = Field(..., min_length=1, max_length=50, description="Bus registration ID")
@@ -422,10 +551,10 @@ class ConductorCountResponse(BaseModel):
 
 
 class CheckpointSubmissionRequest(BaseModel):
-    bus_id: str = Field(..., min_length=1, max_length=50, description="Bus registration ID, e.g. MH-12-QW-4821")
-    route: str = Field(..., min_length=1, max_length=100, description="Route, e.g. Pune – Mumbai")
-    trip_id: str = Field(..., min_length=1, max_length=50, description="Trip identifier, e.g. TRIP-1042-01")
-    checkpoint: str = Field(..., min_length=1, max_length=100, description="Current checkpoint, e.g. Lonavala Bus Stand")
+    bus_id: str = Field(..., min_length=1, max_length=50, description="Bus registration ID")
+    route: str = Field(..., min_length=1, max_length=100, description="Route")
+    trip_id: str = Field(..., min_length=1, max_length=50, description="Trip identifier")
+    checkpoint: str = Field(..., min_length=1, max_length=100, description="Current checkpoint")
     conductor_id: Optional[str] = Field("", max_length=100, description="Conductor name or ID")
     active_tickets: StrictInt = Field(..., ge=0, le=500, description="Active tickets validated at checkpoint")
     valid_passes: StrictInt = Field(..., ge=0, le=500, description="Valid passenger passes at checkpoint")
@@ -433,9 +562,13 @@ class CheckpointSubmissionRequest(BaseModel):
     starting_onboard: StrictInt = Field(..., ge=0, le=500, description="Passengers onboard at start of counting period")
     boarded: Optional[StrictInt] = Field(0, ge=0, le=500, description="Passengers boarded during period")
     alighted: Optional[StrictInt] = Field(0, ge=0, le=500, description="Passengers alighted during period")
-    notes: Optional[str] = Field("", max_length=500, description="Operational notes (no personal passenger data)")
+    notes: Optional[str] = Field("", max_length=500, description="Operational notes")
     camera_estimate: Optional[StrictInt] = Field(None, ge=0, le=500, description="Optional explicit camera estimate snapshot")
     camera_detection_time: Optional[str] = Field("", max_length=100, description="Timestamp of camera detection snapshot")
+    camera_available: Optional[bool] = Field(
+        None,
+        description="False when the panel knows the camera count is unavailable/stale; prevents attaching a stale snapshot."
+    )
 
 
 class CheckpointSubmissionResponse(BaseModel):
@@ -457,10 +590,14 @@ class CheckpointSubmissionResponse(BaseModel):
     camera_estimate: Optional[int]
     camera_detection_time: Optional[str] = ""
     difference: Optional[int]
+    difference_abs: Optional[int] = None
+    reported_difference: Optional[int] = None
     comparison_status: str
+    comparison_status_label: Optional[str] = None
+    camera_status: Optional[str] = ""
+    alert: Optional[Dict[str, Any]] = None
     notes: str
     created_at: str
-
 
 
 @app.get("/api/conductor/buses")
@@ -472,6 +609,41 @@ def get_conductor_buses():
     except Exception as e:
         logger.error(f"Error fetching registered buses: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/conductor/routes")
+def get_conductor_routes():
+    """
+    Returns routes that really exist in the database (registered buses plus
+    routes already used by saved checkpoints). No routes are invented.
+    """
+    try:
+        routes = conductor_db.get_routes()
+        return {"success": True, "routes": routes}
+    except Exception as e:
+        logger.error(f"Error fetching routes: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve routes.")
+
+
+@app.get("/api/conductor/checkpoint-options")
+def get_conductor_checkpoint_options(
+    route: Optional[str] = None,
+    bus_id: Optional[str] = None,
+    bus: Optional[str] = None
+):
+    """
+    Returns checkpoint names previously recorded in the database, optionally
+    filtered by route or bus. The panel may still accept a new checkpoint name.
+    """
+    try:
+        options = conductor_db.get_checkpoint_options(
+            route=route,
+            bus_id=bus_id or bus
+        )
+        return {"success": True, "checkpoints": options}
+    except Exception as e:
+        logger.error(f"Error fetching checkpoint options: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve checkpoint options.")
 
 
 @app.get("/api/conductor/counts", response_model=ConductorCountResponse)
@@ -614,14 +786,24 @@ def submit_checkpoint_record(payload: CheckpointSubmissionRequest):
             alighted=payload.alighted or 0,
             notes=(payload.notes or "").strip(),
             camera_estimate=payload.camera_estimate,
-            camera_detection_time=payload.camera_detection_time
+            camera_detection_time=payload.camera_detection_time,
+            skip_camera_lookup=(payload.camera_available is False),
         )
-        return CheckpointSubmissionResponse(success=True, **saved)
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         logger.error(f"Error persisting checkpoint submission: {e}")
         raise HTTPException(status_code=500, detail="Failed to persist checkpoint record.")
+
+    # The record is committed at this point. The mismatch workflow is idempotent
+    # and additive; a failure here must not hide a successful persistence.
+    alert = None
+    try:
+        alert = alert_dispatch.process_checkpoint_record(saved)
+    except Exception as e:
+        logger.error(f"Mismatch alert workflow failed for checkpoint #{saved.get('id')}: {e}")
+
+    return CheckpointSubmissionResponse(success=True, alert=alert, **saved)
 
 
 @app.get("/api/conductor/checkpoints")
@@ -694,6 +876,6 @@ def get_checkpoint_by_id(record_id: int):
 if __name__ == "__main__":
     import uvicorn
     host = os.environ.get("HOST", "127.0.0.1")
-    port = int(os.environ.get("PORT", 8000))
+    port = int(os.environ.get("PORT", 8001))
     logger.info(f"Starting SMART ST Vision server on http://{host}:{port}")
     uvicorn.run("backend.main:app", host=host, port=port, reload=False)

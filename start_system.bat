@@ -1,9 +1,10 @@
 @echo off
+cd /d "%~dp0"
 echo ========================================================
 echo  SMART ST Control Center - Starting Full Stack System
 echo ========================================================
-echo 1. Launching YOLO & OpenCV Backend on http://127.0.0.1:8000 ...
-start "SMART ST Vision Backend" cmd /k "python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000"
+echo 1. Launching YOLO + OpenCV Backend on http://127.0.0.1:8001 ...
+start "SMART ST Vision Backend" cmd /k "python -m uvicorn backend.main:app --host 127.0.0.1 --port 8001"
 
 timeout /t 2 /nobreak >nul
 

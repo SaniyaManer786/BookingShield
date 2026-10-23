@@ -121,7 +121,7 @@ class TestConductorDbPersistence(unittest.TestCase):
             )
 
     def test_06_discrepancy_signed_calculation(self):
-        """Verify difference = camera_estimate - expected_onboard with signed values."""
+        """Verify difference = reported_passengers - camera_estimate (signed)."""
         bus_id = "MH-09-CV-3372"
         route = "Pune – Kolhapur"
         trip_id = "TRIP-KOLHAPUR-01"
@@ -129,13 +129,16 @@ class TestConductorDbPersistence(unittest.TestCase):
         # Camera count: 50
         conductor_db.record_latest_detection(bus_id, count=50)
 
-        # Expected onboard: 47 (starting 40 + boarded 10 - alighted 3)
+        # Reported: 47 (42 tickets + 5 passes); expected: 47 (40 + 10 - 3)
         res = conductor_db.save_checkpoint_submission(
             bus_id=bus_id, route=route, trip_id=trip_id, checkpoint="Karad Stand",
             active_tickets=42, valid_passes=5, starting_onboard=40, boarded=10, alighted=3
         )
-        self.assertEqual(res["difference"], 3)  # 50 - 47 = +3
+        self.assertEqual(res["reported_passengers"], 47)
+        self.assertEqual(res["difference"], -3)  # 47 - 50 = -3
+        self.assertEqual(res["difference_abs"], 3)
         self.assertEqual(res["comparison_status"], "Discrepancy — verify")
+        self.assertEqual(res["comparison_status_label"], "Mismatch: 3 passengers")
 
         # Camera count: 44
         conductor_db.record_latest_detection(bus_id, count=44)
@@ -143,8 +146,10 @@ class TestConductorDbPersistence(unittest.TestCase):
             bus_id=bus_id, route=route, trip_id=trip_id, checkpoint="Satara Bypass",
             active_tickets=42, valid_passes=5, starting_onboard=40, boarded=10, alighted=3
         )
-        self.assertEqual(res2["difference"], -3)  # 44 - 47 = -3
+        self.assertEqual(res2["difference"], 3)  # 47 - 44 = +3
+        self.assertEqual(res2["difference_abs"], 3)
         self.assertEqual(res2["comparison_status"], "Discrepancy — verify")
+        self.assertEqual(res2["comparison_status_label"], "Mismatch: 3 passengers")
 
     def test_07_get_checkpoint_by_id(self):
         """Verify retrieving a specific checkpoint submission by its primary key ID."""

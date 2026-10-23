@@ -1,320 +1,356 @@
 /**
  * SMART ST Control Center - Computer Vision Monitoring Module
- * Real-time browser camera stream capture & YOLOv8 person detection with OpenCV processing
+ *
+ * Real-time browser camera stream with YOLOv8 person detection.
+ *
+ * The camera and the inference loop live in the shared vision camera service
+ * (src/visionCamera.js) so this page and the Conductor Panel always show the
+ * same feed and the same passenger count - and never compete for the camera.
  */
 
-// Module state
-let activeStream = null;
-let inferenceTimer = null;
-let isProcessingFrame = false;
-
-// Statuses strictly following specifications:
-// Camera Status: 'Camera Off' | 'Requesting Permission' | 'Camera Active' | 'Error'
-let cameraStatus = "Camera Off";
-
-// Model Status: 'Loading Model' | 'Model Ready' | 'Model Error'
-let modelStatus = "Loading Model";
-
-let errorMessage = "";
-let selectedDeviceId = "";
-let videoDevices = [];
-let currentFramePeopleCount = null; // null represents "—" before camera starts
-const inferenceIntervalMs = 300; // Optimal balance for real-time responsiveness and CPU conservation
+import {
+  CameraStatus,
+  ModelStatus,
+  attachVideo,
+  checkBackendModelStatus,
+  getActiveBusId,
+  getState,
+  isCameraActive,
+  postHeartbeat,
+  refreshCameraDevices,
+  registerConsumer,
+  restartCamera,
+  setActiveBusId,
+  startCamera,
+  stopCamera,
+  subscribe
+} from "./visionCamera.js";
 
 const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
-/**
- * Checks backend health and YOLO model readiness via /api/health
- */
-export async function checkBackendModelStatus() {
-  modelStatus = "Loading Model";
-  renderStatusUi();
+function relativeTime(value) {
+  if (!value) return "";
+  const then = new Date(value).getTime();
+  if (!Number.isFinite(then)) return "";
+  const seconds = Math.max(0, Math.round((Date.now() - then) / 1000));
+  if (seconds < 2) return "just now";
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  return `${Math.round(minutes / 60)}h ago`;
+}
 
+let unsubscribe = null;
+let releaseConsumer = null;
+let registeredBuses = [];
+
+/* ------------------------------------------------------------------ */
+/* Backend data                                                        */
+/* ------------------------------------------------------------------ */
+
+async function loadRegisteredBuses() {
   try {
-    const res = await fetch("/api/health");
-    if (res.ok) {
-      const data = await res.json();
-      if (data.status === "healthy" || data.model_loaded === true) {
-        modelStatus = "Model Ready";
-      } else {
-        modelStatus = "Model Error";
-      }
-    } else {
-      modelStatus = "Model Error";
+    const res = await fetch("/api/conductor/buses");
+    if (!res.ok) return;
+    const data = await res.json();
+    if (Array.isArray(data.buses) && data.buses.length) {
+      registeredBuses = data.buses;
+      populateBusSelect();
     }
   } catch (err) {
-    console.warn("Could not reach backend health check:", err);
-    modelStatus = "Model Error";
-  }
-
-  renderStatusUi();
-}
-
-/**
- * Enumerates all available video input devices (webcams)
- */
-export async function refreshCameraDevices() {
-  if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
-  try {
-    const devices = await navigator.mediaDevices.enumerateDevices();
-    videoDevices = devices.filter((d) => d.kind === "videoinput");
-    populateCameraDropdown();
-  } catch (err) {
-    console.warn("Could not enumerate media devices:", err);
+    console.warn("Could not load registered buses:", err);
   }
 }
 
-function populateCameraDropdown() {
+function populateBusSelect() {
+  const select = document.getElementById("cvBusSelect");
+  if (!select || !registeredBuses.length) return;
+  let active = getActiveBusId();
+  // The shared active bus must exist in the backend fleet. If it does not,
+  // adopt the first registered bus so detections are published to a bus the
+  // Conductor Panel can actually poll.
+  if (!registeredBuses.some((bus) => bus.id === active)) {
+    active = registeredBuses[0].id;
+    setActiveBusId(active);
+  }
+  select.innerHTML = registeredBuses
+    .map((bus) => `<option value="${esc(bus.id)}"${bus.id === active ? " selected" : ""}>${esc(bus.id)} · ${esc(bus.route)}</option>`)
+    .join("");
+  select.value = active;
+}
+
+function populateCameraDeviceSelect(devices) {
   const select = document.getElementById("cvCameraSelect");
   if (!select) return;
-  select.innerHTML = "";
-
-  if (videoDevices.length === 0) {
-    const opt = document.createElement("option");
-    opt.value = "";
-    opt.textContent = "Default Browser Camera";
-    select.appendChild(opt);
+  const current = getState().selectedDeviceId;
+  if (!devices.length) {
+    select.innerHTML = `<option value="">Default Browser Camera</option>`;
     return;
   }
-
-  videoDevices.forEach((dev, idx) => {
-    const opt = document.createElement("option");
-    opt.value = dev.deviceId;
-    opt.textContent = dev.label || `Camera ${idx + 1} (${dev.deviceId.slice(0, 8)}...)`;
-    if (dev.deviceId === selectedDeviceId) {
-      opt.selected = true;
-    }
-    select.appendChild(opt);
-  });
+  select.innerHTML = devices
+    .map(
+      (dev, idx) =>
+        `<option value="${esc(dev.deviceId)}"${dev.deviceId === current ? " selected" : ""}>${esc(dev.label || `Camera ${idx + 1}`)}</option>`
+    )
+    .join("");
 }
 
-/**
- * Starts the webcam stream via navigator.mediaDevices.getUserMedia()
- */
-export async function startCamera(deviceId = "") {
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    cameraStatus = "Error";
-    errorMessage = "Camera access is not supported by this browser or secure context (HTTPS or localhost is required).";
-    renderStatusUi();
-    return;
+/* ------------------------------------------------------------------ */
+/* Rendering                                                           */
+/* ------------------------------------------------------------------ */
+
+export function renderComputerVision() {
+  return `
+    <div class="cv-page-container">
+      <!-- Page Heading -->
+      <div class="page-heading">
+        <div>
+          <h1>Computer Vision Monitoring</h1>
+          <p>Real-time browser camera stream with YOLO person detection and passenger counting.</p>
+        </div>
+        <div class="heading-actions">
+          <span class="demo-tag">DEMO ENVIRONMENT</span>
+        </div>
+      </div>
+
+      <!-- Top Summary Grid: Single Prominent Counter & Camera Status -->
+      <div class="cv-hero-grid">
+        <article class="kpi-card cv-people-card">
+          <div class="kpi-top">
+            <span class="kpi-label">PEOPLE DETECTED</span>
+            <span class="kpi-icon teal">👥</span>
+          </div>
+          <div class="cv-people-value" id="cvPeopleCount">—</div>
+          <div class="kpi-foot" id="cvPeopleFoot">Start camera to monitor</div>
+        </article>
+
+        <article class="kpi-card cv-status-card">
+          <div class="kpi-top">
+            <span class="kpi-label">CAMERA STATUS</span>
+            <span class="kpi-icon">📷</span>
+          </div>
+          <div class="cv-status-badge-wrap">
+            <span id="cvCameraStatusBadge" class="status status-reviewed">Camera Off</span>
+          </div>
+          <div class="kpi-foot" id="cvCameraStatusFoot">Webcam standby</div>
+        </article>
+
+        <article class="kpi-card cv-status-card">
+          <div class="kpi-top">
+            <span class="kpi-label">DETECTION MODEL</span>
+            <span class="kpi-icon teal">🧠</span>
+          </div>
+          <div class="cv-status-badge-wrap">
+            <span id="cvModelStatusBadge" class="status status-pending">Loading Model</span>
+          </div>
+          <div class="kpi-foot" id="cvModelStatusFoot">YOLO · person class</div>
+        </article>
+      </div>
+
+      <!-- Error Notice Banner -->
+      <div id="cvErrorBanner" class="cv-error-banner" style="display:none"></div>
+
+      <!-- Unified Camera Controls Bar -->
+      <div class="cv-controls-bar">
+        <div class="cv-controls-left">
+          <button class="btn btn-primary" id="cvStartBtn">
+            ▶ Allow Camera &amp; Start Monitoring
+          </button>
+          <button class="btn btn-danger" id="cvStopBtn" disabled>
+            ■ Stop Camera
+          </button>
+          <button class="btn" id="cvRestartBtn" disabled>
+            ↻ Restart Camera
+          </button>
+        </div>
+        <div class="cv-controls-right">
+          <label class="cv-field">
+            <span>Bus</span>
+            <select id="cvBusSelect" class="form-control cv-select-device" aria-label="Bus monitored by this camera"></select>
+          </label>
+          <label class="cv-field">
+            <span>Camera</span>
+            <select id="cvCameraSelect" class="form-control cv-select-device" aria-label="Camera device"></select>
+          </label>
+          <button class="btn" data-goto="Conductor Panel">
+            🎫 Conductor Panel →
+          </button>
+        </div>
+      </div>
+
+      <!-- Large Live Browser Camera Preview -->
+      <section class="panel cv-preview-panel">
+        <div class="cv-viewport-wrap" id="cvPreviewContainer">
+          <video id="cvVideoElement" class="cv-video" playsinline muted autoplay></video>
+          <canvas id="cvOverlayCanvas" class="cv-canvas"></canvas>
+
+          <div id="cvPlaceholder" class="cv-placeholder">
+            <div class="cv-placeholder-card">
+              <div class="cv-cam-glyph">📷</div>
+              <h3>Browser Camera Off</h3>
+              <p>Click <strong>Allow Camera &amp; Start Monitoring</strong> above to begin real-time YOLO person detection.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+/* ------------------------------------------------------------------ */
+/* Status rendering                                                    */
+/* ------------------------------------------------------------------ */
+
+function cameraBadge(state) {
+  if (state.cameraStatus === CameraStatus.CONNECTED) return { cls: "status status-normal", text: "Camera Active" };
+  if (state.cameraStatus === CameraStatus.CONNECTING) return { cls: "status status-pending", text: "Requesting Permission" };
+  if (state.cameraStatus === CameraStatus.PERMISSION_DENIED) return { cls: "status status-mismatch", text: "Permission Denied" };
+  if (state.cameraStatus === CameraStatus.UNAVAILABLE) return { cls: "status status-mismatch", text: "Camera Unavailable" };
+  if (state.cameraStatus === CameraStatus.ERROR) return { cls: "status status-mismatch", text: "Error" };
+  return { cls: "status status-reviewed", text: "Camera Off" };
+}
+
+function renderStatusUi(state) {
+  const placeholderEl = document.getElementById("cvPlaceholder");
+  const cameraBadgeEl = document.getElementById("cvCameraStatusBadge");
+  const modelBadge = document.getElementById("cvModelStatusBadge");
+  const startBtn = document.getElementById("cvStartBtn");
+  const stopBtn = document.getElementById("cvStopBtn");
+  const restartBtn = document.getElementById("cvRestartBtn");
+  const errorBanner = document.getElementById("cvErrorBanner");
+  const peopleCountEl = document.getElementById("cvPeopleCount");
+  const peopleFootEl = document.getElementById("cvPeopleFoot");
+  const cameraFootEl = document.getElementById("cvCameraStatusFoot");
+  const modelFootEl = document.getElementById("cvModelStatusFoot");
+
+  const streaming = state.cameraStatus === CameraStatus.CONNECTED && !!state.stream;
+
+  if (placeholderEl) placeholderEl.style.display = streaming ? "none" : "flex";
+
+  if (cameraBadgeEl) {
+    const badge = cameraBadge(state);
+    cameraBadgeEl.className = badge.cls;
+    cameraBadgeEl.textContent = badge.text;
   }
 
-  cameraStatus = "Requesting Permission";
-  errorMessage = "";
-  renderStatusUi();
+  if (cameraFootEl) {
+    if (state.cameraStatus === CameraStatus.CONNECTED) cameraFootEl.textContent = "Streaming live video";
+    else if (state.cameraStatus === CameraStatus.CONNECTING) cameraFootEl.textContent = "Awaiting user approval";
+    else if (state.cameraStatus === CameraStatus.PERMISSION_DENIED) cameraFootEl.textContent = "Allow camera in the browser";
+    else if (state.cameraStatus === CameraStatus.UNAVAILABLE) cameraFootEl.textContent = "No camera / unsupported browser";
+    else if (state.cameraStatus === CameraStatus.ERROR) cameraFootEl.textContent = "Check permissions/hardware";
+    else cameraFootEl.textContent = "Webcam standby";
+  }
 
-  // Stop any active stream tracks first
-  stopCameraTracks();
-
-  const constraints = {
-    video: deviceId
-      ? { deviceId: { exact: deviceId } }
-      : { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
-    audio: false
-  };
-
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia(constraints);
-    activeStream = stream;
-    cameraStatus = "Camera Active";
-    errorMessage = "";
-
-    const videoEl = document.getElementById("cvVideoElement");
-    if (videoEl) {
-      videoEl.srcObject = stream;
-      videoEl.onloadedmetadata = () => {
-        videoEl.play().catch((e) => console.warn("Video play error:", e));
-        adjustCanvasSize();
-        startInferenceLoop();
-      };
-    }
-
-    // Refresh devices once permission is granted so human-readable labels appear
-    await refreshCameraDevices();
-    renderStatusUi();
-  } catch (err) {
-    console.error("Camera access error:", err);
-    activeStream = null;
-    cameraStatus = "Error";
-
-    if (err.name === "NotAllowedError" || err.name === "PermissionDeniedError") {
-      errorMessage = "Camera permission denied. Please allow camera access in your browser address bar and click Restart Camera.";
-    } else if (err.name === "NotFoundError" || err.name === "DevicesNotFoundError") {
-      errorMessage = "No camera detected on this computer. Please connect a webcam and click Restart Camera.";
-    } else if (err.name === "NotReadableError" || err.name === "TrackStartError") {
-      errorMessage = "Camera is currently in use by another application. Please close other camera apps and click Restart Camera.";
-    } else if (err.name === "OverconstrainedError") {
-      errorMessage = "Requested camera constraint or resolution is not supported by your hardware.";
+  if (modelBadge) {
+    if (state.modelStatus === ModelStatus.READY) {
+      modelBadge.className = "status status-normal";
+      modelBadge.textContent = "Model Ready";
+    } else if (state.modelStatus === ModelStatus.ERROR) {
+      modelBadge.className = "status status-mismatch";
+      modelBadge.textContent = "Model Error";
     } else {
-      errorMessage = `Camera error: ${err.message || err.name}`;
+      modelBadge.className = "status status-pending";
+      modelBadge.textContent = "Loading Model";
     }
-
-    renderStatusUi();
   }
-}
 
-/**
- * Stops all camera tracks, clears preview, and halts inference
- */
-export function stopCamera() {
-  stopInferenceLoop();
-  stopCameraTracks();
-  cameraStatus = "Camera Off";
-  currentFramePeopleCount = null;
+  if (modelFootEl) {
+    if (state.modelStatus === ModelStatus.ERROR) {
+      modelFootEl.textContent = "Backend model unavailable";
+    } else if (state.lastInferenceMs !== null && state.lastInferenceMs !== undefined) {
+      modelFootEl.textContent = `YOLOv8 person · ${Math.round(state.lastInferenceMs)} ms/frame`;
+    } else {
+      modelFootEl.textContent = "YOLO · person class";
+    }
+  }
 
+  const hasCount = state.lastCount !== null && state.lastCount !== undefined;
+  if (peopleCountEl) {
+    peopleCountEl.textContent = hasCount ? String(state.lastCount) : "—";
+  }
+
+  if (peopleFootEl) {
+    if (!streaming) {
+      peopleFootEl.textContent = "Start camera to monitor";
+    } else if (!hasCount) {
+      peopleFootEl.textContent = "Waiting for first detection…";
+    } else {
+      const updated = relativeTime(state.lastDetectionAt);
+      peopleFootEl.textContent = updated ? `Live current-frame count · ${updated}` : "Live current-frame count";
+    }
+  }
+
+  const isRequesting = state.cameraStatus === CameraStatus.CONNECTING;
+  if (startBtn) {
+    startBtn.disabled = streaming || isRequesting;
+    startBtn.innerHTML = isRequesting ? "⏳ Requesting Permission..." : "▶ Allow Camera &amp; Start Monitoring";
+  }
+  if (stopBtn) stopBtn.disabled = !streaming;
+  if (restartBtn) restartBtn.disabled = state.cameraStatus === CameraStatus.IDLE || isRequesting;
+
+  if (errorBanner) {
+    const showError =
+      !!state.errorMessage &&
+      (state.cameraStatus !== CameraStatus.CONNECTED || state.modelStatus === ModelStatus.ERROR);
+    if (showError) {
+      const title = state.cameraStatus === CameraStatus.CONNECTED ? "Detection Notice" : "Camera Notice";
+      errorBanner.style.display = "block";
+      errorBanner.innerHTML = `
+        <div class="cv-alert-box">
+          <span class="cv-alert-icon">⚠</span>
+          <div class="cv-alert-body">
+            <strong>${title}</strong>
+            <p>${esc(state.errorMessage)}</p>
+          </div>
+          <button class="btn btn-small" id="cvDismissAlert">Dismiss</button>
+        </div>
+      `;
+      document.getElementById("cvDismissAlert")?.addEventListener("click", () => {
+        state.errorMessage = "";
+        errorBanner.style.display = "none";
+      });
+    } else {
+      errorBanner.style.display = "none";
+    }
+  }
+
+  // Attach the shared stream to the visible video element
   const videoEl = document.getElementById("cvVideoElement");
   if (videoEl) {
-    videoEl.srcObject = null;
-  }
-
-  const canvasEl = document.getElementById("cvOverlayCanvas");
-  if (canvasEl) {
-    const ctx = canvasEl.getContext("2d");
-    ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
-  }
-
-  renderStatusUi();
-}
-
-function stopCameraTracks() {
-  if (activeStream) {
-    activeStream.getTracks().forEach((track) => {
-      try {
-        track.stop();
-      } catch (e) {
-        console.warn("Error stopping track:", e);
-      }
-    });
-    activeStream = null;
-  }
-}
-
-/**
- * Restarts the camera stream
- */
-export function restartCamera() {
-  stopCamera();
-  setTimeout(() => {
-    startCamera(selectedDeviceId);
-  }, 250);
-}
-
-/**
- * Inference loop: Captures current frames and sends to backend YOLO
- */
-function startInferenceLoop() {
-  stopInferenceLoop();
-  scheduleNextFrame();
-}
-
-function stopInferenceLoop() {
-  if (inferenceTimer) {
-    clearTimeout(inferenceTimer);
-    inferenceTimer = null;
-  }
-  isProcessingFrame = false;
-}
-
-function scheduleNextFrame() {
-  if (!activeStream || cameraStatus !== "Camera Active") return;
-  inferenceTimer = setTimeout(async () => {
-    await processVideoFrame();
-    scheduleNextFrame();
-  }, inferenceIntervalMs);
-}
-
-/**
- * Captures the current video frame and sends it to the backend for YOLO detection.
- * Confidence threshold is strictly configured and enforced in the backend.
- */
-async function processVideoFrame() {
-  const videoEl = document.getElementById("cvVideoElement");
-  const canvasEl = document.getElementById("cvOverlayCanvas");
-  if (!videoEl || !canvasEl || videoEl.readyState < 2 || isProcessingFrame) return;
-
-  isProcessingFrame = true;
-
-  try {
-    adjustCanvasSize();
-
-    // Capture current frame onto offscreen canvas
-    const offscreen = document.createElement("canvas");
-    const captureW = videoEl.videoWidth || 640;
-    const captureH = videoEl.videoHeight || 480;
-    offscreen.width = captureW;
-    offscreen.height = captureH;
-    const offCtx = offscreen.getContext("2d");
-    offCtx.drawImage(videoEl, 0, 0, captureW, captureH);
-
-    // Compress to JPEG for high-performance low-latency inference
-    const base64Jpeg = offscreen.toDataURL("image/jpeg", 0.75);
-
-    // Send to backend (confidence threshold is handled on backend)
-    const activeBusId = window.__activeMonitoringBusId || "MH-12-QW-4821";
-    const res = await fetch("/api/detect", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        image: base64Jpeg,
-        bus_id: activeBusId
-      })
-    });
-
-    if (res.ok) {
-      const data = await res.json();
-      modelStatus = "Model Ready";
-      handleDetectionResult(data);
-    } else {
-      modelStatus = "Model Error";
-      console.warn("Detection returned error status:", res.status);
+    if (streaming) {
+      attachVideo(videoEl);
+      adjustCanvasSize();
+      drawBoundingBoxes(state.lastDetections, state.lastFrameSize);
+    } else if (videoEl.srcObject) {
+      videoEl.srcObject = null;
     }
-  } catch (err) {
-    modelStatus = "Model Error";
-    console.error("Frame processing error:", err);
-  } finally {
-    isProcessingFrame = false;
-    renderStatusUi();
-  }
-}
-
-/**
- * Handles detection result from backend YOLO
- */
-function handleDetectionResult(result) {
-  const detections = result.detections || [];
-  
-  // The displayed count strictly equals the number of valid person detections returned
-  currentFramePeopleCount = detections.length;
-
-  const counterEl = document.getElementById("cvPeopleCount");
-  if (counterEl) {
-    counterEl.textContent = String(currentFramePeopleCount);
   }
 
-  // Draw YOLO person detection bounding boxes
-  drawBoundingBoxes(detections, result.image_width, result.image_height);
+  populateCameraDeviceSelect(state.devices);
 }
 
-/**
- * Draws YOLO person detection bounding boxes over the video stream with coordinate scaling
- */
-function drawBoundingBoxes(detections, origW, origH) {
+/* ------------------------------------------------------------------ */
+/* Bounding boxes                                                      */
+/* ------------------------------------------------------------------ */
+
+function drawBoundingBoxes(detections, frameSize) {
   const videoEl = document.getElementById("cvVideoElement");
   const canvasEl = document.getElementById("cvOverlayCanvas");
   if (!videoEl || !canvasEl) return;
 
   const ctx = canvasEl.getContext("2d");
   ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
-
   if (!detections || detections.length === 0) return;
 
+  const origW = frameSize?.width || videoEl.videoWidth || canvasEl.width;
+  const origH = frameSize?.height || videoEl.videoHeight || canvasEl.height;
   const canvasW = canvasEl.width;
   const canvasH = canvasEl.height;
-  const vw = videoEl.videoWidth || origW || canvasW;
-  const vh = videoEl.videoHeight || origH || canvasH;
+  const vw = videoEl.videoWidth || origW;
+  const vh = videoEl.videoHeight || origH;
 
-  // Compute exact position and dimensions of the video rendered inside the canvas (handling object-fit: contain)
   const videoRatio = vw / vh;
   const containerRatio = canvasW / canvasH;
   let renderW;
@@ -350,58 +386,47 @@ function drawBoundingBoxes(detections, origW, origH) {
     const w = x2 - x1;
     const h = y2 - y1;
 
-    const color = "#2864dc"; // SMART ST primary blue
+    const color = "#2864dc";
     const cornerColor = "#ffffff";
 
     ctx.save();
-
-    // 1. Semi-transparent fill and bounding rectangle
     ctx.strokeStyle = color;
     ctx.lineWidth = 2.5;
     ctx.fillStyle = "rgba(40, 100, 220, 0.12)";
     ctx.beginPath();
-    if (ctx.roundRect) {
-      ctx.roundRect(x1, y1, w, h, 6);
-    } else {
-      ctx.rect(x1, y1, w, h);
-    }
+    if (ctx.roundRect) ctx.roundRect(x1, y1, w, h, 6);
+    else ctx.rect(x1, y1, w, h);
     ctx.fill();
     ctx.stroke();
 
-    // 2. High-contrast corner brackets for crisp perception
     const cornerSize = Math.min(18, Math.max(8, w / 4), Math.max(8, h / 4));
     ctx.strokeStyle = cornerColor;
     ctx.lineWidth = 3;
 
-    // Top-left corner
     ctx.beginPath();
     ctx.moveTo(x1, y1 + cornerSize);
     ctx.lineTo(x1, y1);
     ctx.lineTo(x1 + cornerSize, y1);
     ctx.stroke();
 
-    // Top-right corner
     ctx.beginPath();
     ctx.moveTo(x2 - cornerSize, y1);
     ctx.lineTo(x2, y1);
     ctx.lineTo(x2, y1 + cornerSize);
     ctx.stroke();
 
-    // Bottom-left corner
     ctx.beginPath();
     ctx.moveTo(x1, y2 - cornerSize);
     ctx.lineTo(x1, y2);
     ctx.lineTo(x1 + cornerSize, y2);
     ctx.stroke();
 
-    // Bottom-right corner
     ctx.beginPath();
     ctx.moveTo(x2 - cornerSize, y2);
     ctx.lineTo(x2, y2);
-    ctx.lineTo(x2, y2 - cornerSize);
+    ctx.lineTo(x2 - cornerSize, y2);
     ctx.stroke();
 
-    // 3. Clean "Person" label pill badge
     const labelText = `Person ${i + 1}`;
     ctx.font = "bold 11px Manrope, 'DM Sans', sans-serif";
     const textWidth = ctx.measureText(labelText).width;
@@ -411,16 +436,12 @@ function drawBoundingBoxes(detections, origW, origH) {
 
     ctx.fillStyle = color;
     ctx.beginPath();
-    if (ctx.roundRect) {
-      ctx.roundRect(x1, badgeY, badgeW, badgeH, 4);
-    } else {
-      ctx.rect(x1, badgeY, badgeW, badgeH);
-    }
+    if (ctx.roundRect) ctx.roundRect(x1, badgeY, badgeW, badgeH, 4);
+    else ctx.rect(x1, badgeY, badgeW, badgeH);
     ctx.fill();
 
     ctx.fillStyle = "#ffffff";
     ctx.fillText(labelText, x1 + 7, badgeY + 14);
-
     ctx.restore();
   });
 }
@@ -429,255 +450,57 @@ function adjustCanvasSize() {
   const videoEl = document.getElementById("cvVideoElement");
   const canvasEl = document.getElementById("cvOverlayCanvas");
   if (!videoEl || !canvasEl) return;
-
   const rect = videoEl.getBoundingClientRect();
   const targetW = Math.round(rect.width);
   const targetH = Math.round(rect.height);
-
   if (targetW > 0 && targetH > 0 && (canvasEl.width !== targetW || canvasEl.height !== targetH)) {
     canvasEl.width = targetW;
     canvasEl.height = targetH;
   }
 }
 
-/**
- * Updates UI statuses, badges, and controls
- */
-function renderStatusUi() {
-  const placeholderEl = document.getElementById("cvPlaceholder");
-  const cameraBadge = document.getElementById("cvCameraStatusBadge");
-  const modelBadge = document.getElementById("cvModelStatusBadge");
-  const startBtn = document.getElementById("cvStartBtn");
-  const stopBtn = document.getElementById("cvStopBtn");
-  const restartBtn = document.getElementById("cvRestartBtn");
-  const errorBanner = document.getElementById("cvErrorBanner");
-  const peopleCountEl = document.getElementById("cvPeopleCount");
-  const peopleFootEl = document.getElementById("cvPeopleFoot");
-  const cameraFootEl = document.getElementById("cvCameraStatusFoot");
+/* ------------------------------------------------------------------ */
+/* Wiring                                                              */
+/* ------------------------------------------------------------------ */
 
-  const isStreaming = cameraStatus === "Camera Active" && activeStream !== null;
-
-  // Placeholder visibility
-  if (placeholderEl) {
-    placeholderEl.style.display = isStreaming ? "none" : "flex";
-  }
-
-  // Camera Status Badge: Camera Off | Requesting Permission | Camera Active | Error
-  if (cameraBadge) {
-    if (cameraStatus === "Camera Active") {
-      cameraBadge.className = "status status-normal";
-      cameraBadge.textContent = "Camera Active";
-    } else if (cameraStatus === "Requesting Permission") {
-      cameraBadge.className = "status status-pending";
-      cameraBadge.textContent = "Requesting Permission";
-    } else if (cameraStatus === "Error") {
-      cameraBadge.className = "status status-mismatch";
-      cameraBadge.textContent = "Error";
-    } else {
-      cameraBadge.className = "status status-reviewed";
-      cameraBadge.textContent = "Camera Off";
-    }
-  }
-
-  if (cameraFootEl) {
-    if (cameraStatus === "Camera Active") {
-      cameraFootEl.textContent = "Streaming live video";
-    } else if (cameraStatus === "Requesting Permission") {
-      cameraFootEl.textContent = "Awaiting user approval";
-    } else if (cameraStatus === "Error") {
-      cameraFootEl.textContent = "Check permissions/hardware";
-    } else {
-      cameraFootEl.textContent = "Webcam standby";
-    }
-  }
-
-  // Model Status Badge: Loading Model | Model Ready | Model Error
-  if (modelBadge) {
-    if (modelStatus === "Model Ready") {
-      modelBadge.className = "status status-normal";
-      modelBadge.textContent = "Model Ready";
-    } else if (modelStatus === "Model Error") {
-      modelBadge.className = "status status-mismatch";
-      modelBadge.textContent = "Model Error";
-    } else {
-      modelBadge.className = "status status-pending";
-      modelBadge.textContent = "Loading Model";
-    }
-  }
-
-  // People Detected Counter
-  if (peopleCountEl) {
-    if (currentFramePeopleCount === null) {
-      peopleCountEl.textContent = "—";
-    } else {
-      peopleCountEl.textContent = String(currentFramePeopleCount);
-    }
-  }
-
-  if (peopleFootEl) {
-    if (cameraStatus === "Camera Active") {
-      peopleFootEl.textContent = "Current frame YOLO count";
-    } else {
-      peopleFootEl.textContent = "Start camera to monitor";
-    }
-  }
-
-  // Buttons state
-  const isRequesting = cameraStatus === "Requesting Permission";
-
-  if (startBtn) {
-    startBtn.disabled = isStreaming || isRequesting;
-    startBtn.innerHTML = isRequesting ? "⏳ Requesting Permission..." : "▶ Allow Camera &amp; Start Monitoring";
-  }
-
-  if (stopBtn) {
-    stopBtn.disabled = !isStreaming;
-  }
-
-  if (restartBtn) {
-    restartBtn.disabled = cameraStatus === "Camera Off" || isRequesting;
-  }
-
-  // Error Banner
-  if (errorBanner) {
-    if (errorMessage && cameraStatus === "Error") {
-      errorBanner.style.display = "block";
-      errorBanner.innerHTML = `
-        <div class="cv-alert-box">
-          <span class="cv-alert-icon">⚠</span>
-          <div class="cv-alert-body">
-            <strong>Camera Notice</strong>
-            <p>${esc(errorMessage)}</p>
-          </div>
-          <button class="btn btn-small" id="cvDismissAlert">Dismiss</button>
-        </div>
-      `;
-      document.getElementById("cvDismissAlert")?.addEventListener("click", () => {
-        errorMessage = "";
-        errorBanner.style.display = "none";
-      });
-    } else {
-      errorBanner.style.display = "none";
-    }
-  }
-}
-
-/**
- * Main Page HTML Renderer for Computer Vision Monitoring
- * Clean, minimal, responsive, single start button, and suitable for classroom demonstration.
- */
-export function renderComputerVision() {
-  return `
-    <div class="cv-page-container">
-      <!-- Page Heading -->
-      <div class="page-heading">
-        <div>
-          <h1>Computer Vision Monitoring</h1>
-          <p>Real-time browser camera stream with YOLO person detection and passenger counting.</p>
-        </div>
-        <div class="heading-actions">
-          <span class="demo-tag">DEMO ENVIRONMENT</span>
-        </div>
-      </div>
-
-      <!-- Top Summary Grid: Single Prominent Counter & Camera Status -->
-      <div class="cv-hero-grid">
-        <!-- Single Prominent People Detected Counter -->
-        <article class="kpi-card cv-people-card">
-          <div class="kpi-top">
-            <span class="kpi-label">PEOPLE DETECTED</span>
-            <span class="kpi-icon teal">👥</span>
-          </div>
-          <div class="cv-people-value" id="cvPeopleCount">—</div>
-          <div class="kpi-foot" id="cvPeopleFoot">Start camera to monitor</div>
-        </article>
-
-        <!-- Camera Status -->
-        <article class="kpi-card cv-status-card">
-          <div class="kpi-top">
-            <span class="kpi-label">CAMERA STATUS</span>
-            <span class="kpi-icon">📷</span>
-          </div>
-          <div class="cv-status-badge-wrap">
-            <span id="cvCameraStatusBadge" class="status status-reviewed">Camera Off</span>
-          </div>
-          <div class="kpi-foot" id="cvCameraStatusFoot">Webcam standby</div>
-        </article>
-      </div>
-
-      <!-- Error Notice Banner -->
-      <div id="cvErrorBanner" class="cv-error-banner" style="display:none"></div>
-
-      <!-- Single Unified Camera Controls Bar -->
-      <div class="cv-controls-bar">
-        <div class="cv-controls-left">
-          <button class="btn btn-primary" id="cvStartBtn">
-            ▶ Allow Camera &amp; Start Monitoring
-          </button>
-          <button class="btn btn-danger" id="cvStopBtn" disabled>
-            ■ Stop Camera
-          </button>
-          <button class="btn" id="cvRestartBtn" disabled>
-            ↻ Restart Camera
-          </button>
-        </div>
-        <div class="cv-controls-right">
-          <button class="btn" data-goto="Conductor Panel">
-            🎫 Conductor Panel →
-          </button>
-        </div>
-      </div>
-
-      <!-- Large Live Browser Camera Preview -->
-      <section class="panel cv-preview-panel">
-        <div class="cv-viewport-wrap" id="cvPreviewContainer">
-          <video id="cvVideoElement" class="cv-video" playsinline muted autoplay></video>
-          <canvas id="cvOverlayCanvas" class="cv-canvas"></canvas>
-
-          <!-- Placeholder before camera starts -->
-          <div id="cvPlaceholder" class="cv-placeholder">
-            <div class="cv-placeholder-card">
-              <div class="cv-cam-glyph">📷</div>
-              <h3>Browser Camera Off</h3>
-              <p>Click <strong>Allow Camera &amp; Start Monitoring</strong> above to begin real-time YOLO person detection.</p>
-            </div>
-          </div>
-        </div>
-      </section>
-    </div>
-  `;
-}
-
-/**
- * Attaches all event listeners for the Computer Vision page
- */
 export function wireComputerVisionControls() {
   checkBackendModelStatus();
   refreshCameraDevices();
-  renderStatusUi();
+  loadRegisteredBuses();
 
-  // Expose global cleanup so navigating away stops camera tracks immediately
-  window.__stopVisionMonitoring = stopCamera;
+  releaseConsumer = registerConsumer("computer-vision");
+  unsubscribe = subscribe(renderStatusUi);
 
-  // Single unified start action
-  document.getElementById("cvStartBtn")?.addEventListener("click", () => startCamera(selectedDeviceId));
+  // Reuse a camera session that is already running (started on the panel)
+  if (isCameraActive()) {
+    attachVideo(document.getElementById("cvVideoElement"));
+  }
 
-  // Stop & Restart handlers
-  document.getElementById("cvStopBtn")?.addEventListener("click", stopCamera);
-  document.getElementById("cvRestartBtn")?.addEventListener("click", restartCamera);
+  document.getElementById("cvStartBtn")?.addEventListener("click", () => startCamera(getState().selectedDeviceId));
+  document.getElementById("cvStopBtn")?.addEventListener("click", () => stopCamera());
+  document.getElementById("cvRestartBtn")?.addEventListener("click", () => restartCamera());
 
-  // Camera selection dropdown
   document.getElementById("cvCameraSelect")?.addEventListener("change", (e) => {
-    selectedDeviceId = e.target.value;
-    if (activeStream) {
-      startCamera(selectedDeviceId);
-    }
+    const deviceId = e.target.value;
+    const current = getState();
+    current.selectedDeviceId = deviceId;
+    if (isCameraActive()) startCamera(deviceId);
   });
 
-  // Responsive canvas resize listener
+  document.getElementById("cvBusSelect")?.addEventListener("change", (e) => {
+    setActiveBusId(e.target.value);
+    postHeartbeat("bus_selected");
+  });
+
   window.addEventListener("resize", adjustCanvasSize);
 
-  // Stop camera if user leaves or refreshes
-  window.addEventListener("beforeunload", stopCamera);
-  window.addEventListener("pagehide", stopCamera);
+  // Global cleanup hook used by the page router.
+  window.__stopVisionMonitoring = () => {
+    // The shared camera session is only released when no other page needs it.
+    if (releaseConsumer) releaseConsumer();
+    releaseConsumer = null;
+    if (unsubscribe) unsubscribe();
+    unsubscribe = null;
+    postHeartbeat("page_closed");
+  };
 }

@@ -96,12 +96,88 @@ INITIAL_BUSES = [
 ]
 
 
+# Maximum passengers accepted in a single counting field (safety limit)
+MAX_PASSENGER_COUNT = 500
+
+# A camera count older than this many seconds is reported as stale, not current.
+CAMERA_COUNT_STALE_SECONDS = 20
+
+
 def get_db_connection() -> sqlite3.Connection:
     """Returns an SQLite connection with Row row_factory."""
     os.makedirs(DB_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def ensure_columns(cursor: sqlite3.Cursor, table: str, columns: List[tuple]) -> None:
+    """Adds missing columns to an existing table (safe migration for live databases)."""
+    cursor.execute(f"PRAGMA table_info({table})")
+    existing = [row[1] for row in cursor.fetchall()]
+    for name, ddl in columns:
+        if name not in existing:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+
+
+def compute_checkpoint_metrics(
+    active_tickets: int,
+    valid_passes: int,
+    other_authorized: int,
+    starting_onboard: int,
+    boarded: int,
+    alighted: int,
+    camera_estimate: Optional[int],
+) -> Dict[str, Any]:
+    """
+    Single source of truth for checkpoint passenger arithmetic.
+
+    Business rules (identical on the frontend, see src/conductorPanel.js):
+      reported_passengers = active_tickets + valid_passes + other_authorized
+      expected_onboard    = starting_onboard + boarded - alighted
+      difference          = reported_passengers - camera_estimate  (signed)
+      difference_abs      = abs(difference)
+
+    The two occupancy values are deliberately kept separate:
+      expected_onboard is derived only from passenger movement;
+      camera_estimate is only ever a real YOLO/OpenCV detection count.
+
+    A camera estimate of None means "no camera data" and never becomes zero.
+    comparison_status keeps its historical wording for stored records, while
+    comparison_status_label carries the panel-facing wording required by the
+    Conductor Panel ("Match" / "Mismatch: N passengers" / unavailable).
+    """
+    reported_passengers = active_tickets + valid_passes + other_authorized
+    expected_onboard = starting_onboard + boarded - alighted
+
+    if camera_estimate is None:
+        difference = None
+        difference_abs = None
+        reported_difference = None
+        comparison_status = "Comparison unavailable"
+        comparison_status_label = "Camera unavailable"
+    else:
+        difference = reported_passengers - camera_estimate
+        difference_abs = abs(difference)
+        # Kept for backwards compatibility with earlier records / API clients.
+        reported_difference = difference
+        if difference == 0:
+            comparison_status = "Match"
+            comparison_status_label = "Match"
+        else:
+            comparison_status = "Discrepancy — verify"
+            comparison_status_label = f"Mismatch: {difference_abs} passenger{'s' if difference_abs != 1 else ''}"
+
+    return {
+        "reported_passengers": reported_passengers,
+        "expected_onboard": expected_onboard,
+        "camera_estimate": camera_estimate,
+        "difference": difference,
+        "difference_abs": difference_abs,
+        "reported_difference": reported_difference,
+        "comparison_status": comparison_status,
+        "comparison_status_label": comparison_status_label,
+    }
 
 
 def init_db():
@@ -132,6 +208,18 @@ def init_db():
                 bus_id TEXT PRIMARY KEY,
                 detected_count INTEGER NOT NULL,
                 inference_time_ms REAL DEFAULT 0.0,
+                updated_at TEXT NOT NULL
+            )
+        """)
+
+        # Camera session heartbeat table (status reported by the monitoring page)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS camera_sessions (
+                bus_id TEXT PRIMARY KEY,
+                session_id TEXT DEFAULT '',
+                camera_status TEXT DEFAULT 'idle',
+                model_status TEXT DEFAULT 'unknown',
+                message TEXT DEFAULT '',
                 updated_at TEXT NOT NULL
             )
         """)
@@ -177,11 +265,21 @@ def init_db():
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_chk_bus_trip ON checkpoint_submissions(bus_id, trip_id, created_at DESC)")
 
-        # Safe migration for existing DB instances: check if camera_detection_time column exists
+        # Safe migration for existing DB instances: add newer columns if missing
         cursor.execute("PRAGMA table_info(checkpoint_submissions)")
         existing_cols = [r[1] for r in cursor.fetchall()]
         if "camera_detection_time" not in existing_cols:
             cursor.execute("ALTER TABLE checkpoint_submissions ADD COLUMN camera_detection_time TEXT DEFAULT ''")
+
+        ensure_columns(cursor, "checkpoint_submissions", [
+            ("period_start", "TEXT DEFAULT ''"),
+            ("period_end", "TEXT DEFAULT ''"),
+            ("camera_status", "TEXT DEFAULT ''"),
+            ("reported_difference", "INTEGER"),
+            ("difference_abs", "INTEGER"),
+            ("alert_id", "INTEGER"),
+            ("source", "TEXT DEFAULT 'conductor_panel'"),
+        ])
 
         # Populate registered buses if empty
         cursor.execute("SELECT COUNT(*) FROM registered_buses")
@@ -418,7 +516,12 @@ def save_checkpoint_submission(
     notes: str = "",
     conductor_id: str = "",
     camera_estimate: Optional[int] = None,
-    camera_detection_time: Optional[str] = None
+    camera_detection_time: Optional[str] = None,
+    camera_status: str = "",
+    period_start: Optional[str] = None,
+    period_end: Optional[str] = None,
+    source: str = "conductor_panel",
+    skip_camera_lookup: bool = False
 ) -> Dict[str, Any]:
     """
     Saves a persistent checkpoint submission record for SMART ST Conductor Panel.
@@ -435,6 +538,7 @@ def save_checkpoint_submission(
     checkpoint = (checkpoint or "").strip()
     conductor_id = (conductor_id or "").strip()
     notes = (notes or "").strip()
+    camera_status = (camera_status or "").strip()
 
     if not bus_id:
         raise ValueError("Bus registration number is required.")
@@ -458,11 +562,44 @@ def save_checkpoint_submission(
             raise ValueError(f"{name} must be a whole integer.")
         if val < 0:
             raise ValueError(f"{name} cannot be negative.")
-        if val > 500:
-            raise ValueError(f"{name} exceeds reasonable limit (500).")
+        if val > MAX_PASSENGER_COUNT:
+            raise ValueError(f"{name} exceeds reasonable limit ({MAX_PASSENGER_COUNT}).")
 
-    reported_passengers = active_tickets + valid_passes + other_authorized
-    expected_onboard = starting_onboard + boarded - alighted
+    # Resolve latest camera detection if not explicitly passed. Callers that
+    # know the camera is offline/stale pass skip_camera_lookup=True so a stale
+    # snapshot is never attached to a new record. Even when the caller does not
+    # say anything, only a detection newer than CAMERA_COUNT_STALE_SECONDS is
+    # considered valid: an old checkpoint count must not masquerade as live
+    # camera data.
+    detection_snapshot = None
+    if camera_estimate is None and not skip_camera_lookup:
+        detection_snapshot = get_latest_detection(bus_id)
+        if detection_snapshot and detection_snapshot.get("detected_count") is not None:
+            age = _age_seconds(detection_snapshot.get("updated_at"))
+            if age is not None and age <= CAMERA_COUNT_STALE_SECONDS:
+                camera_estimate = detection_snapshot["detected_count"]
+                if not camera_detection_time:
+                    camera_detection_time = detection_snapshot.get("updated_at")
+            else:
+                camera_status = camera_status or "stale"
+    if camera_estimate is not None and not camera_status:
+        camera_status = "connected"
+
+    metrics = compute_checkpoint_metrics(
+        active_tickets=active_tickets,
+        valid_passes=valid_passes,
+        other_authorized=other_authorized,
+        starting_onboard=starting_onboard,
+        boarded=boarded,
+        alighted=alighted,
+        camera_estimate=camera_estimate,
+    )
+    reported_passengers = metrics["reported_passengers"]
+    expected_onboard = metrics["expected_onboard"]
+    difference = metrics["difference"]
+    difference_abs = metrics["difference_abs"]
+    reported_difference = metrics["reported_difference"]
+    comparison_status = metrics["comparison_status"]
 
     if expected_onboard < 0:
         raise ValueError(
@@ -470,25 +607,9 @@ def save_checkpoint_submission(
             f"- alighted ({alighted}) yields negative expected occupancy ({expected_onboard})."
         )
 
-    # Resolve latest camera detection if not explicitly passed
-    if camera_estimate is None:
-        det = get_latest_detection(bus_id)
-        if det and det.get("detected_count") is not None:
-            camera_estimate = det["detected_count"]
-            if not camera_detection_time:
-                camera_detection_time = det.get("updated_at")
-
-    if camera_estimate is not None:
-        difference = camera_estimate - expected_onboard
-        if difference == 0:
-            comparison_status = "Match"
-        else:
-            comparison_status = "Discrepancy — verify"
-    else:
-        difference = None
-        comparison_status = "Comparison unavailable"
-
     now_iso = datetime.now(timezone.utc).isoformat()
+    period_start_iso = (period_start or "").strip() or _derive_period_start(bus_id, trip_id, now_iso)
+    period_end_iso = (period_end or "").strip() or now_iso
 
     conn = get_db_connection()
     try:
@@ -499,15 +620,19 @@ def save_checkpoint_submission(
                 active_tickets, valid_passes, other_authorized,
                 starting_onboard, boarded, alighted,
                 reported_passengers, expected_onboard,
-                camera_estimate, camera_detection_time, difference, comparison_status,
+                camera_estimate, camera_detection_time,
+                difference, difference_abs, reported_difference,
+                comparison_status, camera_status, period_start, period_end, source,
                 notes, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             bus_id, route, trip_id, checkpoint, conductor_id,
             active_tickets, valid_passes, other_authorized,
             starting_onboard, boarded, alighted,
             reported_passengers, expected_onboard,
-            camera_estimate, camera_detection_time or "", difference, comparison_status,
+            camera_estimate, camera_detection_time or "",
+            difference, difference_abs, reported_difference,
+            comparison_status, camera_status, period_start_iso, period_end_iso, source,
             notes, now_iso
         ))
         record_id = cursor.lastrowid
@@ -546,12 +671,61 @@ def save_checkpoint_submission(
             "camera_estimate": camera_estimate,
             "camera_detection_time": camera_detection_time or "",
             "difference": difference,
+            "difference_abs": difference_abs,
+            "reported_difference": reported_difference,
             "comparison_status": comparison_status,
+            "comparison_status_label": metrics["comparison_status_label"],
+            "camera_status": camera_status,
+            "period_start": period_start_iso,
+            "period_end": period_end_iso,
+            "source": source,
             "notes": notes,
             "created_at": now_iso
         }
     finally:
         conn.close()
+
+
+def _derive_period_start(bus_id: str, trip_id: str, fallback_iso: str) -> str:
+    """
+    Derives the start of the counting period for a checkpoint.
+
+    The period starts when the previous checkpoint of the same trip was recorded.
+    For the first checkpoint of a trip the period starts at the trip's first
+    recorded checkpoint (or the submission time when nothing exists yet).
+    """
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT created_at FROM checkpoint_submissions
+            WHERE bus_id = ? AND trip_id = ?
+            ORDER BY created_at DESC, id DESC LIMIT 1
+            """,
+            (bus_id, trip_id)
+        )
+        row = cursor.fetchone()
+        if row and row[0]:
+            return row[0]
+        return fallback_iso
+    finally:
+        conn.close()
+
+
+def set_checkpoint_alert_id(record_id: int, alert_id: Optional[int]) -> None:
+    """Links a saved checkpoint record to the mismatch alert it produced (if any)."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE checkpoint_submissions SET alert_id = ? WHERE id = ?",
+            (alert_id, record_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
 
 
 def get_checkpoint_history(
@@ -610,4 +784,197 @@ def get_checkpoint_by_id(record_id: int) -> Optional[Dict[str, Any]]:
         return dict(row) if row else None
     finally:
         conn.close()
+
+
+def get_routes() -> List[Dict[str, Any]]:
+    """
+    Returns the real routes known to the system.
+
+    Sources: routes assigned to registered buses and routes recorded on saved
+    checkpoint submissions. No routes are invented.
+    """
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT route,
+                   COUNT(DISTINCT bus_id) AS bus_count,
+                   MAX(created_at) AS last_activity
+            FROM (
+                SELECT route, id AS bus_id, NULL AS created_at FROM registered_buses
+                UNION ALL
+                SELECT route, bus_id, created_at FROM checkpoint_submissions
+            )
+            WHERE route IS NOT NULL AND TRIM(route) != ''
+            GROUP BY route
+            ORDER BY route ASC
+        """)
+        return [dict(row) for row in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def get_checkpoint_options(route: Optional[str] = None, bus_id: Optional[str] = None) -> List[str]:
+    """
+    Returns checkpoint names that really exist in the database.
+
+    Used to populate the checkpoint selector on the Conductor Panel without
+    inventing checkpoint records.
+    """
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        query = """
+            SELECT checkpoint, MAX(created_at) AS last_used, COUNT(*) AS uses
+            FROM checkpoint_submissions
+            WHERE checkpoint IS NOT NULL AND TRIM(checkpoint) != ''
+        """
+        params: List[Any] = []
+        if route and route.strip():
+            query += " AND route = ?"
+            params.append(route.strip())
+        if bus_id and bus_id.strip():
+            query += " AND bus_id = ?"
+            params.append(bus_id.strip())
+        query += " GROUP BY checkpoint ORDER BY last_used DESC, checkpoint ASC"
+        cursor.execute(query, tuple(params))
+        return [row[0] for row in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def record_camera_session(
+    bus_id: str,
+    camera_status: str = "idle",
+    model_status: str = "unknown",
+    message: str = "",
+    session_id: str = ""
+) -> Dict[str, Any]:
+    """
+    Stores the latest camera session heartbeat reported by the monitoring page.
+
+    This lets the Conductor Panel show the real camera state (connecting,
+    permission denied, model unavailable, ...) without starting a second camera.
+    """
+    bus_id = (bus_id or "").strip()
+    if not bus_id:
+        raise ValueError("Bus registration number is required.")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    camera_status = (camera_status or "idle").strip()
+    model_status = (model_status or "unknown").strip()
+    message = (message or "").strip()
+    session_id = (session_id or "").strip()
+
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO camera_sessions
+            (bus_id, session_id, camera_status, model_status, message, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(bus_id) DO UPDATE SET
+                session_id = excluded.session_id,
+                camera_status = excluded.camera_status,
+                model_status = excluded.model_status,
+                message = excluded.message,
+                updated_at = excluded.updated_at
+        """, (bus_id, session_id, camera_status, model_status, message, now_iso))
+        conn.commit()
+        return {
+            "bus_id": bus_id,
+            "session_id": session_id,
+            "camera_status": camera_status,
+            "model_status": model_status,
+            "message": message,
+            "updated_at": now_iso
+        }
+    finally:
+        conn.close()
+
+
+def get_camera_session(bus_id: str) -> Optional[Dict[str, Any]]:
+    """Returns the last recorded camera session heartbeat for a bus."""
+    bus_id = (bus_id or "").strip()
+    if not bus_id:
+        return None
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM camera_sessions WHERE bus_id = ?", (bus_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def _age_seconds(iso_timestamp: Optional[str]) -> Optional[float]:
+    """Returns the age of an ISO timestamp in seconds (None when unknown)."""
+    if not iso_timestamp:
+        return None
+    try:
+        parsed = datetime.fromisoformat(iso_timestamp)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return round((datetime.now(timezone.utc) - parsed).total_seconds(), 1)
+    except Exception:
+        return None
+
+
+def get_camera_state(
+    bus_id: str,
+    model_available: bool = True,
+    stale_after_seconds: int = CAMERA_COUNT_STALE_SECONDS
+) -> Dict[str, Any]:
+    """
+    Returns the shared camera state used by the Conductor Panel.
+
+    The passenger count itself always comes from the real OpenCV/YOLO inference
+    pipeline (latest_detections, written by POST /api/detect). A missing count is
+    reported as unavailable and is never converted to zero.
+    """
+    bus_id = (bus_id or "").strip()
+    detection = get_latest_detection(bus_id) if bus_id else None
+    session = get_camera_session(bus_id) if bus_id else None
+
+    count = detection["detected_count"] if detection else None
+    detected_at = detection["updated_at"] if detection else None
+    age = _age_seconds(detected_at)
+    stale = bool(age is not None and age > stale_after_seconds)
+
+    camera_status = (session or {}).get("camera_status") or "idle"
+    model_status = (session or {}).get("model_status") or "unknown"
+    message = (session or {}).get("message") or ""
+
+    if not model_available:
+        status = "model_unavailable"
+        message = message or "YOLO model is not loaded on the backend."
+    elif camera_status in ("permission_denied", "unavailable", "error"):
+        status = camera_status
+    elif camera_status == "connecting":
+        status = "connecting"
+    elif count is None:
+        status = "unavailable"
+        message = message or "No camera frames have been received for this bus yet."
+    elif stale:
+        status = "stale"
+        message = message or f"Last camera count is {int(age)} seconds old."
+    else:
+        status = "connected"
+
+    return {
+        "bus_id": bus_id,
+        "count": count,
+        "updated_at": detected_at,
+        "age_seconds": age,
+        "stale": stale,
+        "status": status,
+        "camera_status": camera_status,
+        "model_status": model_status,
+        "message": message,
+        "session_updated_at": (session or {}).get("updated_at"),
+        "inference_time_ms": (detection or {}).get("inference_time_ms", 0.0),
+        "source": "yolo_opencv",
+        "stale_after_seconds": stale_after_seconds,
+    }
+
 
