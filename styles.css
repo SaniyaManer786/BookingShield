@@ -566,6 +566,17 @@ body.sidebar-collapsed .sidebar{width:70px;padding-left:9px;padding-right:9px}bo
 .cond-table tbody tr:hover td {
   background: #f8fbff;
 }
+.cond-history-row {
+  cursor: pointer;
+}
+.cond-history-row:focus-visible td {
+  background: #eef6ff;
+  outline: 2px solid #2f80ed;
+  outline-offset: -2px;
+}
+.cond-history-row.is-selected td {
+  background: #eaf4ff;
+}
 .cond-history-checkpoint {
   font-weight: 700;
   color: var(--cond-ink);

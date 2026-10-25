@@ -24,6 +24,7 @@ const API = {
   checkpointOptions: "/api/conductor/checkpoint-options",
   latest: "/api/conductor/checkpoint/latest",
   history: "/api/conductor/checkpoints",
+  byId: "/api/conductor/checkpoints",
   cameraState: "/api/conductor/camera-state",
   submit: "/api/conductor/checkpoint"
 };
@@ -47,6 +48,7 @@ const state = {
   camera: emptyCamera(),
   history: [],
   latest: null,
+  selectedRecordId: null,
   submitting: false,
   pollTimer: null,
   pollBusy: false,
@@ -109,6 +111,25 @@ function text(id, value) {
 function setValue(id, value) {
   const el = $(id);
   if (el) el.value = value === null || value === undefined ? "" : String(value);
+}
+
+const COUNT_FIELDS = [
+  "condActiveTickets",
+  "condValidPasses",
+  "condOtherAuth",
+  "condStartingOnboard",
+  "condBoarded",
+  "condAlighted"
+];
+
+/**
+ * A new checkpoint starts with empty count fields. Nothing is copied from the
+ * previous checkpoint, demo data or a hardcoded default; the conductor must
+ * enter every count for this checkpoint manually.
+ */
+function resetCountFields() {
+  COUNT_FIELDS.forEach((id) => setValue(id, ""));
+  setValue("condNotes", "");
 }
 
 function plural(count) {
@@ -369,7 +390,8 @@ function renderHistory() {
             ? "Match"
             : `Mismatch: ${Math.abs(row.difference)}`;
       const tone = label === "Match" ? "is-ok" : label.startsWith("Mismatch") ? "is-error" : "is-offline";
-      return `<tr>
+      const selected = state.selectedRecordId === row.id;
+      return `<tr class="cond-history-row${selected ? " is-selected" : ""}" data-record-id="${esc(row.id)}" tabindex="0" role="button" aria-pressed="${selected ? "true" : "false"}" title="Load these saved counts into the form">
         <td>${esc(formatTime(row.created_at))}</td>
         <td class="cond-history-checkpoint">${esc(row.checkpoint)}</td>
         <td>${esc(row.reported_passengers)}</td>
@@ -468,8 +490,9 @@ async function loadBootstrap() {
     applyBusDetails(initialBus, { keepCounts: false });
     state.loaded = true;
 
+    state.route = $("condRoute")?.value || initialBus.route || "";
     await Promise.all([
-      loadCheckpointOptions(initialBus.id),
+      loadCheckpointOptions(initialBus.id, state.route),
       loadLatest(initialBus.id),
       loadHistory(initialBus.id),
       fetchCamera(initialBus.id)
@@ -493,40 +516,58 @@ function renderBusOptions() {
 }
 
 function renderRouteOptions() {
-  const list = $("condRouteOptions");
-  if (!list) return;
-  list.innerHTML = state.routes
-    .map((row) => `<option value="${esc(row.route)}"></option>`)
+  const select = $("condRoute");
+  if (!select) return;
+  const currentValue = select.value || state.route || "";
+  select.innerHTML = state.routes
+    .map((row) => `<option value="${esc(row.route)}">${esc(row.route)}</option>`)
     .join("");
+  if (currentValue) {
+    select.value = currentValue;
+    state.route = currentValue;
+  } else if (select.options.length > 0) {
+    select.value = select.options[0].value;
+    state.route = select.value;
+  }
 }
 
 function renderCheckpointOptions() {
-  const list = $("condCheckpointOptions");
-  if (!list) return;
-  list.innerHTML = state.checkpoints.map((name) => `<option value="${esc(name)}"></option>`).join("");
+  const select = $("condCheckpoint");
+  if (!select) return;
+  const currentValue = select.value || "";
+  select.innerHTML = state.checkpoints
+    .map((name) => `<option value="${esc(name)}">${esc(name)}</option>`)
+    .join("");
+  if (currentValue && state.checkpoints.includes(currentValue)) {
+    select.value = currentValue;
+  } else if (state.checkpoints.length > 0) {
+    select.value = state.checkpoints[0];
+  } else {
+    select.value = "";
+  }
 }
 
 function applyBusDetails(bus, { keepCounts = true } = {}) {
   if (!bus) return;
-  setValue("condRoute", bus.route || "");
+  const routeVal = bus.route || "";
+  setValue("condRoute", routeVal);
+  state.route = routeVal;
   setValue("condTripId", bus.default_trip || "");
   setValue("condConductorId", bus.operator || "");
   if (!keepCounts) {
-    setValue("condActiveTickets", 0);
-    setValue("condValidPasses", 0);
-    setValue("condOtherAuth", 0);
-    setValue("condStartingOnboard", 0);
-    setValue("condBoarded", 0);
-    setValue("condAlighted", 0);
-    setValue("condNotes", "");
+    resetCountFields();
     setValue("condCheckpoint", "");
   }
   text("condBusMeta", `${bus.fleet || "Fleet"} · ${bus.depot || "Depot"} depot · ${bus.capacity || "—"} seats`);
 }
 
-async function loadCheckpointOptions(busId) {
+async function loadCheckpointOptions(busId, route) {
   try {
-    const data = await api(`${API.checkpointOptions}?bus_id=${encodeURIComponent(busId)}`);
+    const routeParam = route || state.route || ($("condRoute")?.value || "");
+    const query = new URLSearchParams();
+    if (busId) query.append("bus_id", busId);
+    if (routeParam) query.append("route", routeParam);
+    const data = await api(`${API.checkpointOptions}?${query.toString()}`);
     if (state.busId !== busId) return;
     state.checkpoints = Array.isArray(data.checkpoints) ? data.checkpoints : [];
   } catch {
@@ -536,7 +577,7 @@ async function loadCheckpointOptions(busId) {
   renderCheckpointOptions();
 }
 
-async function loadLatest(busId, { prefill = true } = {}) {
+async function loadLatest(busId) {
   try {
     const data = await api(`${API.latest}?bus_id=${encodeURIComponent(busId)}`);
     if (state.busId !== busId) return;
@@ -546,19 +587,9 @@ async function loadLatest(busId, { prefill = true } = {}) {
     state.latest = null;
   }
 
+  // The latest saved record is shown only as a reference note. Its counts are
+  // never copied into the form: a new checkpoint must be entered manually.
   if (state.latest) {
-    if (prefill) {
-      // Pre-fill from the real previous checkpoint without overwriting trip identity.
-      setValue("condCheckpoint", state.latest.checkpoint || "");
-      setValue("condTripId", state.latest.trip_id || $("condTripId")?.value || "");
-      setValue("condConductorId", state.latest.conductor_id || $("condConductorId")?.value || "");
-      setValue("condActiveTickets", state.latest.active_tickets ?? 0);
-      setValue("condValidPasses", state.latest.valid_passes ?? 0);
-      setValue("condOtherAuth", state.latest.other_authorized ?? 0);
-      setValue("condStartingOnboard", state.latest.expected_onboard ?? 0);
-      setValue("condBoarded", 0);
-      setValue("condAlighted", 0);
-    }
     text(
       "condLatestNote",
       `Last saved: ${state.latest.checkpoint} · ${formatTime(state.latest.created_at)}`
@@ -567,6 +598,71 @@ async function loadLatest(busId, { prefill = true } = {}) {
     text("condLatestNote", "No previous checkpoint saved for this bus.");
   }
   renderResult();
+}
+
+/**
+ * Copies an explicitly selected saved checkpoint into the form so it can be
+ * viewed or corrected. This is only called from a user action on the history
+ * table, never during initial load or bus selection.
+ */
+function applyCheckpointRecord(record) {
+  if (!record) return;
+
+  const routeSelect = $("condRoute");
+  if (routeSelect && record.route) {
+    if (!Array.from(routeSelect.options).some((option) => option.value === record.route)) {
+      routeSelect.add(new Option(record.route, record.route));
+    }
+    routeSelect.value = record.route;
+    state.route = record.route;
+  }
+
+  const checkpointSelect = $("condCheckpoint");
+  if (checkpointSelect && record.checkpoint) {
+    if (!Array.from(checkpointSelect.options).some((option) => option.value === record.checkpoint)) {
+      checkpointSelect.add(new Option(record.checkpoint, record.checkpoint));
+    }
+    checkpointSelect.value = record.checkpoint;
+  }
+
+  setValue("condTripId", record.trip_id || "");
+  setValue("condConductorId", record.conductor_id || "");
+  setValue("condActiveTickets", record.active_tickets ?? "");
+  setValue("condValidPasses", record.valid_passes ?? "");
+  setValue("condOtherAuth", record.other_authorized ?? "");
+  setValue("condStartingOnboard", record.starting_onboard ?? "");
+  setValue("condBoarded", record.boarded ?? "");
+  setValue("condAlighted", record.alighted ?? "");
+  setValue("condNotes", record.notes || "");
+
+  state.selectedRecordId = record.id ?? null;
+  renderHistory();
+  renderResult();
+  const previewBox = $("condPreviewBox");
+  if (previewBox) previewBox.style.display = "none";
+  showMessage(
+    `Loaded saved checkpoint #${record.id} (${record.checkpoint}). Review or edit the counts, then submit to record a new checkpoint.`,
+    "info"
+  );
+}
+
+async function loadCheckpointRecord(recordId) {
+  if (recordId === null || recordId === undefined || recordId === "") return;
+  let record = state.history.find((row) => String(row.id) === String(recordId)) || null;
+  if (!record) {
+    try {
+      const data = await api(`${API.byId}/${encodeURIComponent(recordId)}`);
+      record = data && data.checkpoint ? data.checkpoint : null;
+    } catch (err) {
+      showMessage(`Could not load checkpoint #${recordId}: ${err.message}`, "error");
+      return;
+    }
+  }
+  if (!record) {
+    showMessage(`Checkpoint #${recordId} was not found.`, "error");
+    return;
+  }
+  applyCheckpointRecord(record);
 }
 
 async function loadHistory(busId) {
@@ -735,7 +831,7 @@ async function submit() {
       window.__smartstToast(`Checkpoint #${saved.id} saved.`);
     }
 
-    await Promise.all([loadLatest(state.busId, { prefill: false }), loadHistory(state.busId), fetchCamera(state.busId)]);
+    await Promise.all([loadLatest(state.busId), loadHistory(state.busId), fetchCamera(state.busId)]);
     const previewBox = $("condPreviewBox");
     if (previewBox) previewBox.style.display = "none";
   } catch (err) {
@@ -758,12 +854,14 @@ async function changeBus(busId) {
   setActiveBusId(busId);
   state.camera = emptyCamera();
   state.history = [];
+  state.selectedRecordId = null;
   renderHistory();
   renderResult();
   const bus = currentBus();
   applyBusDetails(bus, { keepCounts: false });
+  state.route = $("condRoute")?.value || bus?.route || "";
   clearMessage();
-  await Promise.all([loadCheckpointOptions(busId), loadLatest(busId), loadHistory(busId), fetchCamera(busId)]);
+  await Promise.all([loadCheckpointOptions(busId, state.route), loadLatest(busId), loadHistory(busId), fetchCamera(busId)]);
   startCameraPolling();
 }
 
@@ -804,16 +902,14 @@ export function renderConductorPanel() {
 
           <div class="cond-field">
             <label for="condRoute">Route</label>
-            <input id="condRoute" class="cond-input" list="condRouteOptions" placeholder="Route name" autocomplete="off" />
-            <datalist id="condRouteOptions"></datalist>
-            <span class="cond-help">Suggestions come from the database.</span>
+            <select id="condRoute" class="cond-input"></select>
+            <span class="cond-help">Routes from the database.</span>
           </div>
 
           <div class="cond-field">
             <label for="condCheckpoint">Current checkpoint</label>
-            <input id="condCheckpoint" class="cond-input" list="condCheckpointOptions" placeholder="Checkpoint name" autocomplete="off" />
-            <datalist id="condCheckpointOptions"></datalist>
-            <span class="cond-help">Previously saved checkpoints are suggested.</span>
+            <select id="condCheckpoint" class="cond-input"></select>
+            <span class="cond-help">Checkpoints for the selected route.</span>
           </div>
 
           <div class="cond-field">
@@ -844,28 +940,28 @@ export function renderConductorPanel() {
         <div class="cond-grid cond-grid-3">
           <div class="cond-field">
             <label for="condActiveTickets">Active tickets</label>
-            <input id="condActiveTickets" class="cond-input cond-number" type="number" min="0" max="${MAX_COUNT}" step="1" inputmode="numeric" value="0" />
+            <input id="condActiveTickets" class="cond-input cond-number" type="number" min="0" max="${MAX_COUNT}" step="1" inputmode="numeric" />
           </div>
           <div class="cond-field">
             <label for="condValidPasses">Valid passes</label>
-            <input id="condValidPasses" class="cond-input cond-number" type="number" min="0" max="${MAX_COUNT}" step="1" inputmode="numeric" value="0" />
+            <input id="condValidPasses" class="cond-input cond-number" type="number" min="0" max="${MAX_COUNT}" step="1" inputmode="numeric" />
           </div>
           <div class="cond-field">
             <label for="condOtherAuth">Other authorized passengers</label>
-            <input id="condOtherAuth" class="cond-input cond-number" type="number" min="0" max="${MAX_COUNT}" step="1" inputmode="numeric" value="0" />
+            <input id="condOtherAuth" class="cond-input cond-number" type="number" min="0" max="${MAX_COUNT}" step="1" inputmode="numeric" />
           </div>
 
           <div class="cond-field">
             <label for="condStartingOnboard">Starting onboard count</label>
-            <input id="condStartingOnboard" class="cond-input cond-number" type="number" min="0" max="${MAX_COUNT}" step="1" inputmode="numeric" value="0" />
+            <input id="condStartingOnboard" class="cond-input cond-number" type="number" min="0" max="${MAX_COUNT}" step="1" inputmode="numeric" />
           </div>
           <div class="cond-field">
             <label for="condBoarded">Passengers boarded since last checkpoint</label>
-            <input id="condBoarded" class="cond-input cond-number" type="number" min="0" max="${MAX_COUNT}" step="1" inputmode="numeric" value="0" />
+            <input id="condBoarded" class="cond-input cond-number" type="number" min="0" max="${MAX_COUNT}" step="1" inputmode="numeric" />
           </div>
           <div class="cond-field">
             <label for="condAlighted">Passengers alighted since last checkpoint</label>
-            <input id="condAlighted" class="cond-input cond-number" type="number" min="0" max="${MAX_COUNT}" step="1" inputmode="numeric" value="0" />
+            <input id="condAlighted" class="cond-input cond-number" type="number" min="0" max="${MAX_COUNT}" step="1" inputmode="numeric" />
           </div>
         </div>
 
@@ -954,7 +1050,7 @@ export function renderConductorPanel() {
         <div class="cond-history">
           <div class="cond-history-head">
             <h3>Recent checkpoints</h3>
-            <span>Last ${HISTORY_LIMIT} saved records for this bus</span>
+            <span>Select a row to load its saved counts · Last ${HISTORY_LIMIT} saved records for this bus</span>
           </div>
           <div class="cond-table-wrap">
             <table class="cond-table">
@@ -993,11 +1089,27 @@ export function wireConductorPanelControls() {
   state.camera = emptyCamera();
   state.history = [];
   state.latest = null;
+  state.selectedRecordId = null;
   renderResult();
   renderHistory();
   showMessage("", "info");
 
   $("condBus")?.addEventListener("change", (event) => changeBus(event.target.value));
+
+  // Saved counts are loaded only when the conductor explicitly picks a history
+  // row. Initial load and bus changes always start from an empty count form.
+  const historyBody = $("condHistoryBody");
+  historyBody?.addEventListener("click", (event) => {
+    const row = event.target.closest("tr[data-record-id]");
+    if (row) loadCheckpointRecord(row.dataset.recordId);
+  });
+  historyBody?.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    const row = event.target.closest("tr[data-record-id]");
+    if (!row) return;
+    event.preventDefault();
+    loadCheckpointRecord(row.dataset.recordId);
+  });
 
   // Let the app-level [data-goto] handler navigate, but stop the "#" anchor from
   // scrolling the page before the panel re-renders.
@@ -1009,6 +1121,13 @@ export function wireConductorPanelControls() {
       const previewBox = $("condPreviewBox");
       if (previewBox && previewBox.style.display !== "none") previewBox.style.display = "none";
     });
+  });
+
+  $("condRoute")?.addEventListener("change", async (event) => {
+    state.route = event.target.value || "";
+    const previewBox = $("condPreviewBox");
+    if (previewBox) previewBox.style.display = "none";
+    await loadCheckpointOptions(state.busId, state.route);
   });
 
   $("condPreviewBtn")?.addEventListener("click", preview);

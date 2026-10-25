@@ -21,6 +21,9 @@ let alerts = [
   {id:"ALT-24075",bus:"MH-12-KL-2811",route:routes[3],passengers:40,tickets:39,mismatch:1,time:"09:32 AM",severity:"Low",status:"Resolved",stop:"Shirwal"},
   {id:"ALT-24072",bus:"MH-14-TR-7104",route:routes[1],passengers:44,tickets:42,mismatch:2,time:"09:08 AM",severity:"Medium",status:"Under Review",stop:"Sangamner"}
 ];
+
+let apiAlertsCache = [];
+let alertsPollingInterval = null;
 let inspections = [
   {id:"INSP-6018",bus:buses[1].id,route:routes[1],checker:"Pravin Deshmukh",location:"Sangamner Bus Stand",mismatch:"No",outcome:"No Mismatch Found",time:"Today, 10:16 AM"},
   {id:"INSP-6017",bus:buses[4].id,route:routes[4],checker:"Meena Patil",location:"Indapur Bypass",mismatch:"Yes · 2",outcome:"Mismatch Confirmed",time:"Today, 09:48 AM"},
@@ -60,7 +63,66 @@ function lineChart(seriesA,seriesB,labels,legendA,legendB){
   const circles=a=>a.map((v,i)=>`<circle class="chart-dot" cx="${pad.l+i*cw/(a.length-1)}" cy="${pad.t+ch-(v/max)*ch}" r="3"/>`).join("");
   return `<svg viewBox="0 0 ${w} ${h}" role="img" aria-label="${esc(legendA)} and ${esc(legendB)} trend chart">${[0,1,2,3].map(i=>{let y=pad.t+ch*i/3;return `<line class="chart-gridline" x1="${pad.l}" x2="${w-pad.r}" y1="${y}" y2="${y}"/><text class="chart-label" x="1" y="${y+3}">${Math.round(max*(1-i/3))}</text>`}).join("")}${labels.map((l,i)=>`<text class="chart-label" text-anchor="middle" x="${pad.l+i*cw/(labels.length-1)}" y="${h-5}">${esc(l)}</text>`).join("")}<polyline class="chart-line" points="${points(seriesA)}"/>${circles(seriesA)}<polyline class="chart-line secondary" points="${points(seriesB)}"/>${circles(seriesB).replaceAll("chart-dot", "chart-dot teal")}</svg><div class="chart-legend"><span class="legend-item"><i class="legend-dot"></i>${esc(legendA)}</span><span class="legend-item"><i class="legend-dot teal"></i>${esc(legendB)}</span></div>`;
 }
-function alertItems(){return alerts.filter(a=>a.status!=="Resolved").slice(0,4).map(a=>`<div class="alert-item"><span class="alert-indicator ${a.severity==="Low"?"medium":""}"></span><div class="alert-main"><strong>${esc(a.bus)} · ${a.mismatch} passenger mismatch${a.mismatch===1?"":"es"}</strong><p>${esc(a.route)} · ${esc(a.stop)} · ${esc(a.time)}</p></div><button class="btn-text" data-action="alert-detail" data-id="${esc(a.id)}">View</button></div>`).join("")||`<div class="empty-state">No active alerts.</div>`}
+function formatAlertTime(isoString){
+  if(!isoString) return "";
+  try{
+    const d = new Date(isoString);
+    return d.toLocaleTimeString("en-IN", {hour:"2-digit", minute:"2-digit", hour12:true});
+  }catch(e){
+    return isoString;
+  }
+}
+
+async function fetchAlertsFromApi(){
+  try{
+    const res = await fetch("/api/alerts?limit=200", { cache: "no-store" });
+    if(!res.ok) throw new Error("Failed to fetch alerts");
+    const data = await res.json();
+    const apiAlerts = data.alerts || data || [];
+    if(Array.isArray(apiAlerts)){
+      apiAlertsCache = apiAlerts.map(a => {
+        const mismatch = Math.abs(a.difference ?? a.reported_difference ?? a.difference_abs ?? 0);
+        const reported = a.reported_passengers ?? a.reported ?? 0;
+        const camera = a.camera_estimate ?? a.expected_onboard ?? null;
+        const tickets = camera !== null ? camera : (reported - mismatch);
+        return {
+          id: a.alert_code || a.id,
+          dbId: a.id,
+          bus: a.bus_id || a.bus,
+          route: a.route || "",
+          passengers: reported,
+          tickets: tickets,
+          mismatch: mismatch,
+          difference: a.difference,
+          difference_abs: a.difference_abs || mismatch,
+          time: a.created_at ? formatAlertTime(a.created_at) : (a.time || ""),
+          created_at: a.created_at,
+          severity: a.severity || (mismatch >= 4 ? "High" : mismatch >= 2 ? "Medium" : "Low"),
+          status: a.status || "New",
+          stop: a.checkpoint || a.stop || ""
+        };
+      });
+      // Merge API alerts with existing local ones, prefer API data
+      // Build a map of API alerts by id
+      const apiMap = new Map(apiAlertsCache.map(a => [a.id, a]));
+      // Update existing alerts that come from API
+      alerts = alerts.map(a => apiMap.has(a.id) ? { ...a, ...apiMap.get(a.id) } : a);
+      // Add any API alerts not in local list
+      apiAlertsCache.forEach(a => {
+        if(!alerts.find(x => x.id === a.id)) {
+          alerts.push(a);
+        }
+      });
+    }
+  }catch(e){
+    // Keep using local alerts if API fails
+  }
+}
+
+function alertItems(){
+  const allAlerts = apiAlertsCache.length ? [...apiAlertsCache] : alerts;
+  return allAlerts.filter(a=>a.status!=="Resolved").slice(0,4).map(a=>`<div class="alert-item"><span class="alert-indicator ${a.severity==="Low"?"medium":""}"></span><div class="alert-main"><strong>${esc(a.bus)} · ${a.mismatch} passenger mismatch${a.mismatch===1?"":"es"}</strong><p>${esc(a.route)} · ${esc(a.stop)} · ${esc(a.time)}</p></div><button class="btn-text" data-action="alert-detail" data-id="${esc(a.id)}">View</button></div>`).join("")||`<div class="empty-state">No active alerts.</div>`
+}
 
 function renderDashboard(){
  const totalP=buses.reduce((n,b)=>n+b.passengers,0), totalT=buses.reduce((n,b)=>n+b.tickets,0);

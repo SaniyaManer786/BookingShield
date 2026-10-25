@@ -42,7 +42,7 @@ try:
 except Exception:
     pass
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -106,7 +106,7 @@ model_device = "cpu"
 model_name = "YOLOv8n"
 MODEL_PATH = os.environ.get("YOLO_MODEL_PATH", "yolov8n.pt")
 
-DEFAULT_YOLO_CONFIDENCE_THRESHOLD = 0.70
+DEFAULT_YOLO_CONFIDENCE_THRESHOLD = 0.25
 
 
 def get_yolo_confidence_threshold() -> float:
@@ -336,14 +336,51 @@ def detect_people(payload: DetectionRequest):
     try:
         if payload.track:
             # Persistent multi-object tracking (ByteTrack)
-            results = yolo_model.track(
-                img,
-                classes=[0],
-                conf=conf_threshold,
-                iou=payload.iou,
-                persist=True,
-                verbose=False
-            )
+            try:
+                results = yolo_model.track(
+                    img,
+                    classes=[0],
+                    conf=conf_threshold,
+                    iou=payload.iou,
+                    persist=True,
+                    verbose=False
+                )
+            except Exception as track_e:
+                logger.warning(f"Tracking failed ({track_e}); attempting tracker reset and retry.")
+                predictor = getattr(yolo_model, "predictor", None)
+                if predictor is not None:
+                    try:
+                        for tracker in getattr(predictor, "trackers", None) or []:
+                            reset = getattr(tracker, "reset", None)
+                            if callable(reset):
+                                try:
+                                    reset()
+                                except Exception:
+                                    pass
+                        predictor.__dict__.pop("trackers", None)
+                        predictor.__dict__.pop("vid_path", None)
+                    except Exception:
+                        pass
+                # Try again with tracking
+                try:
+                    results = yolo_model.track(
+                        img,
+                        classes=[0],
+                        conf=conf_threshold,
+                        iou=payload.iou,
+                        persist=True,
+                        verbose=False
+                    )
+                except Exception:
+                    # Final fallback to non-tracking
+                    logger.warning(f"Tracking failed again, falling back to detection without tracking.")
+                    results = yolo_model(
+                        img,
+                        classes=[0],
+                        conf=conf_threshold,
+                        iou=payload.iou,
+                        verbose=False
+                    )
         else:
             results = yolo_model(
                 img,
@@ -353,32 +390,8 @@ def detect_people(payload: DetectionRequest):
                 verbose=False
             )
     except Exception as e:
-        if not payload.track:
-            logger.error(f"Inference error: {e}")
-            raise HTTPException(status_code=500, detail=f"Inference failed: {str(e)}")
-
-        # Tracker state can become inconsistent (after a reset, a resolution
-        # change or a dropped frame). Drop the state and retry this single
-        # frame as plain detection so the camera stream never dies with a 500.
-        logger.warning(f"Tracking failed ({e}); retrying this frame without tracking.")
-        predictor = getattr(yolo_model, "predictor", None)
-        if predictor is not None:
-            predictor.__dict__.pop("trackers", None)
-            predictor.__dict__.pop("vid_path", None)
-        try:
-            results = yolo_model(
-                img,
-                classes=[0],
-                conf=conf_threshold,
-                iou=payload.iou,
-                verbose=False
-            )
-        except Exception as retry_error:
-            logger.error(f"Inference error after tracking fallback: {retry_error}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Inference failed: {str(retry_error)}"
-            )
+        logger.error(f"Inference error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Inference failed: {str(e)}")
 
     inference_time_ms = round((time.perf_counter() - t_inf_start) * 1000, 2)
 
@@ -871,6 +884,108 @@ def get_checkpoint_by_id(record_id: int):
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# Mismatch Alerts API endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/alerts")
+@app.get("/api/mismatch-alerts")
+def get_mismatch_alerts(
+    bus_id: Optional[str] = Query(None),
+    route: Optional[str] = Query(None),
+    severity: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    limit: int = Query(100),
+):
+    try:
+        alerts = alert_dispatch.list_alerts(
+            bus_id=bus_id,
+            route=route,
+            severity=severity,
+            status=status,
+            limit=limit,
+        )
+        return {"success": True, "alerts": alerts, "count": len(alerts)}
+    except Exception as e:
+        logger.error(f"Error fetching mismatch alerts: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve mismatch alerts.")
+
+
+@app.get("/api/alerts/{alert_id}")
+@app.get("/api/mismatch-alerts/{alert_id}")
+def get_mismatch_alert(alert_id: int):
+    try:
+        alert = alert_dispatch.get_alert_by_id(alert_id)
+        if not alert:
+            raise HTTPException(status_code=404, detail=f"Alert #{alert_id} not found.")
+        return {"success": True, "alert": alert}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching mismatch alert: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve mismatch alert.")
+
+
+class AlertStatusUpdate(BaseModel):
+    status: str = Field(..., description="New / Under Review / Resolved")
+
+
+@app.put("/api/alerts/{alert_id}/status")
+@app.post("/api/alerts/{alert_id}/status")
+@app.put("/api/mismatch-alerts/{alert_id}/status")
+@app.post("/api/mismatch-alerts/{alert_id}/status")
+def update_mismatch_alert_status(alert_id: int, payload: AlertStatusUpdate):
+    try:
+        alert = alert_dispatch.update_alert_status(alert_id, payload.status)
+        if not alert:
+            raise HTTPException(status_code=404, detail=f"Alert #{alert_id} not found.")
+        return {"success": True, "alert": alert}
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating mismatch alert status: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update mismatch alert status.")
+
+
+@app.put("/api/alerts/{alert_id}/resolve")
+@app.post("/api/alerts/{alert_id}/resolve")
+@app.put("/api/mismatch-alerts/{alert_id}/resolve")
+def resolve_mismatch_alert(alert_id: int):
+    try:
+        alert = alert_dispatch.update_alert_status(alert_id, "Resolved")
+        if not alert:
+            raise HTTPException(status_code=404, detail=f"Alert #{alert_id} not found.")
+        return {"success": True, "alert": alert}
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error resolving mismatch alert: {e}")
+        raise HTTPException(status_code=500, detail="Failed to resolve mismatch alert.")
+
+
+@app.put("/api/alerts/{alert_id}/review")
+@app.post("/api/alerts/{alert_id}/review")
+@app.put("/api/mismatch-alerts/{alert_id}/review")
+def review_mismatch_alert(alert_id: int):
+    try:
+        alert = alert_dispatch.update_alert_status(alert_id, "Under Review")
+        if not alert:
+            raise HTTPException(status_code=404, detail=f"Alert #{alert_id} not found.")
+        return {"success": True, "alert": alert}
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error reviewing mismatch alert: {e}")
+        raise HTTPException(status_code=500, detail="Failed to review mismatch alert.")
 
 
 if __name__ == "__main__":
