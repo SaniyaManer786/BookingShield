@@ -42,25 +42,27 @@ try:
 except Exception:
     pass
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, StrictInt, model_validator
+from pydantic import AliasChoices, BaseModel, Field, StrictInt, model_validator
 
 # Local imports
 try:
     from . import conductor_db
     from . import alert_dispatch
+    from . import etm_db
 except Exception:
     import conductor_db
     import alert_dispatch
+    import etm_db
 
 # Initialize FastAPI app
 app = FastAPI(
     title="SMART ST Vision API",
-    description="Browser camera frame inference for real-time person detection & passenger monitoring using YOLO and OpenCV",
-    version="1.0.0"
+    description="Browser camera frame inference, ETM ticketing and passenger monitoring using YOLO and OpenCV",
+    version="1.19.4"
 )
 
 
@@ -176,6 +178,10 @@ async def startup_event():
         alert_dispatch.init_db()
     except Exception as e:
         logger.error(f"Error initializing mismatch alert database: {e}")
+    try:
+        etm_db.init_db()
+    except Exception as e:
+        logger.error(f"Error initializing ETM ticketing database: {e}")
     try:
         load_model()
     except Exception as e:
@@ -582,11 +588,18 @@ class CheckpointSubmissionRequest(BaseModel):
         None,
         description="False when the panel knows the camera count is unavailable/stale; prevents attaching a stale snapshot."
     )
+    use_ticketing_totals: Optional[bool] = Field(
+        True,
+        description="Use valid ETM tickets and passes as the authoritative passenger totals when records exist."
+    )
 
 
 class CheckpointSubmissionResponse(BaseModel):
     success: bool
     id: int
+    bus_trip_id: Optional[int] = None
+    expected_count_id: Optional[int] = None
+    vision_count_id: Optional[int] = None
     bus_id: str
     route: str
     trip_id: str
@@ -608,6 +621,13 @@ class CheckpointSubmissionResponse(BaseModel):
     comparison_status: str
     comparison_status_label: Optional[str] = None
     camera_status: Optional[str] = ""
+    ticket_count: int = 0
+    ticket_passengers: int = 0
+    pass_count: int = 0
+    pass_passengers: int = 0
+    ticket_revenue: float = 0.0
+    ticketing_source: str = "manual"
+    ticket_summary: Optional[Dict[str, Any]] = None
     alert: Optional[Dict[str, Any]] = None
     notes: str
     created_at: str
@@ -758,6 +778,23 @@ def get_conductor_comparison(
     return {"success": True, **comp}
 
 
+@app.get("/api/comparisons/active-trips")
+@app.get("/api/conductor/trip-comparisons")
+def get_active_trip_comparisons(
+    tolerance: Optional[int] = Query(None, ge=0, le=100),
+):
+    """Returns ETM expected vs latest camera count for every active trip."""
+    try:
+        data = etm_db.get_active_trip_comparisons(
+            model_available=yolo_model is not None,
+            tolerance=tolerance,
+        )
+        return {"success": True, **data}
+    except Exception as e:
+        logger.error(f"Error building active trip comparisons: {e}")
+        raise HTTPException(status_code=500, detail="Failed to build active trip comparisons.")
+
+
 @app.post("/api/conductor/checkpoints", response_model=CheckpointSubmissionResponse, status_code=201)
 @app.post("/api/conductor/checkpoint", response_model=CheckpointSubmissionResponse, status_code=201)
 def submit_checkpoint_record(payload: CheckpointSubmissionRequest):
@@ -801,6 +838,7 @@ def submit_checkpoint_record(payload: CheckpointSubmissionRequest):
             camera_estimate=payload.camera_estimate,
             camera_detection_time=payload.camera_detection_time,
             skip_camera_lookup=(payload.camera_available is False),
+            use_ticketing_totals=(payload.use_ticketing_totals is not False),
         )
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
@@ -884,6 +922,533 @@ def get_checkpoint_by_id(record_id: int):
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# ETM ticketing and passenger pass endpoints
+# ---------------------------------------------------------------------------
+
+
+class FareSettingsRequest(BaseModel):
+    route: str = Field(..., min_length=1, max_length=100)
+    full_fare: float = Field(..., gt=0, le=100000)
+    half_fare: float = Field(..., ge=0, le=100000)
+    free_fare: float = Field(0.0, ge=0, le=0)
+    currency: str = Field("INR", min_length=1, max_length=10)
+
+
+class TicketCategoryItem(BaseModel):
+    category_code: str = Field(
+        ...,
+        min_length=1,
+        max_length=32,
+        validation_alias=AliasChoices("category_code", "code"),
+    )
+    quantity: StrictInt = Field(0, ge=0, le=500)
+
+
+class TicketIssueRequest(BaseModel):
+    bus_id: str = Field(..., min_length=1, max_length=50)
+    route: str = Field(..., min_length=1, max_length=100)
+    trip_id: str = Field(..., min_length=1, max_length=50)
+    conductor_id: Optional[str] = Field("", max_length=100)
+    full_count: StrictInt = Field(0, ge=0, le=500)
+    half_count: StrictInt = Field(0, ge=0, le=500)
+    free_count: StrictInt = Field(0, ge=0, le=500)
+    items: Optional[List[TicketCategoryItem]] = Field(None, max_length=50)
+    boarding_stop: Optional[str] = Field("", max_length=100)
+    destination_stop: Optional[str] = Field("", max_length=100)
+    client_request_id: Optional[str] = Field(
+        "",
+        max_length=128,
+        validation_alias=AliasChoices(
+            "client_request_id",
+            "request_id",
+            "idempotency_key",
+        ),
+        description="Optional idempotency key used to prevent duplicate ticket submissions.",
+    )
+
+
+class PassengerCategoryRequest(BaseModel):
+    code: str = Field(..., min_length=1, max_length=32)
+    label: str = Field(..., min_length=1, max_length=80)
+    fare_basis: str = Field("full", min_length=1, max_length=10)
+    sort_order: Optional[int] = Field(None, ge=0, le=9999)
+    active: bool = True
+
+
+class PassRegistrationRequest(BaseModel):
+    bus_id: str = Field(..., min_length=1, max_length=50)
+    route: str = Field(..., min_length=1, max_length=100)
+    trip_id: str = Field(..., min_length=1, max_length=50)
+    conductor_id: Optional[str] = Field("", max_length=100)
+    pass_number: Optional[str] = Field(
+        "",
+        max_length=60,
+        validation_alias=AliasChoices("pass_number", "pass_id"),
+    )
+    pass_type: str = Field("Monthly Pass", min_length=1, max_length=60)
+    passenger_count: StrictInt = Field(1, ge=1, le=500)
+    valid_from: Optional[str] = Field("", max_length=30)
+    valid_until: Optional[str] = Field("", max_length=30)
+    boarding_stop: Optional[str] = Field("", max_length=100)
+    destination_stop: Optional[str] = Field("", max_length=100)
+    notes: Optional[str] = Field("", max_length=500)
+
+
+class DispatchRequest(BaseModel):
+    bus_id: str = Field(..., min_length=1, max_length=50)
+    checker_id: str = Field(..., min_length=1, max_length=50)
+    location: Optional[str] = Field("", max_length=150)
+    checkpoint: Optional[str] = Field("", max_length=100)
+    notes: Optional[str] = Field("", max_length=500)
+    alert_id: Optional[int] = Field(None, ge=1)
+    route: Optional[str] = Field("", max_length=100)
+    trip_id: Optional[str] = Field("", max_length=50)
+
+
+class DispatchCompletionRequest(BaseModel):
+    outcome: str = Field(..., min_length=1, max_length=50)
+    notes: Optional[str] = Field("", max_length=1000)
+    mismatch_confirmed: Optional[bool] = None
+
+
+class BusTripStartRequest(BaseModel):
+    bus_id: str = Field(..., min_length=1, max_length=50)
+    route: str = Field(..., min_length=1, max_length=100)
+    trip_id: str = Field(..., min_length=1, max_length=50)
+    conductor_id: Optional[str] = Field("", max_length=100)
+
+
+@app.get("/api/conductor/trips/active")
+def get_active_bus_trip(bus_id: str = Query(..., min_length=1, max_length=50)):
+    try:
+        trip = conductor_db.get_active_bus_trip(bus_id)
+        if not trip:
+            raise HTTPException(status_code=404, detail="No active trip for this bus.")
+        return {"success": True, "trip": trip}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching active trip: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve active trip.")
+
+
+@app.get("/api/conductor/trips")
+def get_bus_trips(
+    bus_id: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=500),
+):
+    try:
+        trips = conductor_db.list_bus_trips(bus_id=bus_id, status=status, limit=limit)
+        return {"success": True, "trips": trips, "count": len(trips)}
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Error fetching trips: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve trips.")
+
+
+@app.post("/api/conductor/trips")
+def start_bus_trip(payload: BusTripStartRequest):
+    try:
+        trip = conductor_db.start_bus_trip(
+            bus_id=payload.bus_id,
+            route=payload.route,
+            trip_id=payload.trip_id,
+            conductor_id=payload.conductor_id or "",
+        )
+        return {"success": True, "trip": trip}
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Error starting trip: {e}")
+        raise HTTPException(status_code=500, detail="Failed to start trip.")
+
+
+@app.get("/api/conductor/trips/{trip_record_id}")
+def get_bus_trip(trip_record_id: int, include_summary: bool = Query(True)):
+    try:
+        trip = conductor_db.get_bus_trip_by_id(trip_record_id)
+        if not trip:
+            raise HTTPException(status_code=404, detail="Trip not found.")
+        response = {"success": True, "trip": trip}
+        if include_summary:
+            response["summary"] = conductor_db.get_trip_summary(trip_record_id)
+        return response
+    except HTTPException:
+        raise
+    except ValueError as ve:
+        raise HTTPException(status_code=404, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Error fetching trip: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve trip.")
+
+
+@app.post("/api/conductor/trips/{trip_record_id}/complete")
+def complete_bus_trip(trip_record_id: int):
+    try:
+        trip = conductor_db.complete_bus_trip(trip_record_id=trip_record_id)
+        return {"success": True, "trip": trip}
+    except ValueError as ve:
+        message = str(ve)
+        raise HTTPException(status_code=404 if message == "Trip not found." else 400, detail=message)
+    except Exception as e:
+        logger.error(f"Error completing trip: {e}")
+        raise HTTPException(status_code=500, detail="Failed to complete trip.")
+
+
+@app.get("/api/conductor/fares")
+def get_conductor_fare_settings(route: str = Query(..., min_length=1, max_length=100)):
+    try:
+        fares = etm_db.get_fare_settings(route)
+        return {"success": True, "fares": fares}
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Error fetching fare settings: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve fare settings.")
+
+
+@app.post("/api/conductor/fares")
+def save_conductor_fare_settings(payload: FareSettingsRequest):
+    try:
+        fares = etm_db.save_fare_settings(
+            route=payload.route,
+            full_fare=payload.full_fare,
+            half_fare=payload.half_fare,
+            free_fare=payload.free_fare,
+            currency=payload.currency,
+        )
+        return {"success": True, "fares": fares}
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Error saving fare settings: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save fare settings.")
+
+
+@app.get("/api/conductor/passenger-categories")
+def get_conductor_passenger_categories(include_inactive: bool = Query(False)):
+    try:
+        categories = etm_db.get_passenger_categories(include_inactive=include_inactive)
+        return {"success": True, "categories": categories, "count": len(categories)}
+    except Exception as e:
+        logger.error(f"Error fetching passenger categories: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve passenger categories.")
+
+
+@app.post("/api/conductor/passenger-categories")
+def save_conductor_passenger_category(payload: PassengerCategoryRequest):
+    try:
+        category = etm_db.save_passenger_category(
+            code=payload.code,
+            label=payload.label,
+            fare_basis=payload.fare_basis,
+            sort_order=payload.sort_order,
+            active=payload.active,
+        )
+        return {"success": True, "category": category}
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Error saving passenger category: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save passenger category.")
+
+
+@app.get("/api/conductor/route-stops")
+def get_conductor_route_stops(
+    route: str = Query(..., min_length=1, max_length=100),
+    bus_id: Optional[str] = Query(None, max_length=50),
+):
+    try:
+        stops = conductor_db.get_route_stops(route, bus_id=bus_id)
+        return {"success": True, "route": route, "stops": stops}
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Error fetching route stops: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve route stops.")
+
+
+@app.get("/api/conductor/tickets")
+def get_conductor_tickets(
+    bus_id: Optional[str] = Query(None),
+    trip_id: Optional[str] = Query(None),
+    route: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=500),
+):
+    try:
+        tickets = etm_db.list_tickets(
+            bus_id=bus_id,
+            trip_id=trip_id,
+            route=route,
+            status=status,
+            limit=limit,
+        )
+        return {"success": True, "tickets": tickets, "count": len(tickets)}
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Error fetching tickets: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve tickets.")
+
+
+@app.get("/api/conductor/tickets/{ticket_id}")
+def get_conductor_ticket(ticket_id: int):
+    try:
+        ticket = etm_db.get_ticket_by_id(ticket_id)
+        if not ticket:
+            raise HTTPException(status_code=404, detail=f"Ticket #{ticket_id} not found.")
+        return {"success": True, "ticket": ticket}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching ticket: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve ticket.")
+
+
+@app.post("/api/conductor/tickets", status_code=201)
+def issue_conductor_ticket(
+    payload: TicketIssueRequest,
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+):
+    try:
+        request_id = (payload.client_request_id or idempotency_key or "").strip()
+        ticket = etm_db.issue_ticket(
+            bus_id=payload.bus_id,
+            route=payload.route,
+            trip_id=payload.trip_id,
+            conductor_id=payload.conductor_id or "",
+            full_count=payload.full_count,
+            half_count=payload.half_count,
+            free_count=payload.free_count,
+            client_request_id=request_id,
+            items=[item.model_dump() for item in payload.items] if payload.items is not None else None,
+            boarding_stop=payload.boarding_stop or "",
+            destination_stop=payload.destination_stop or "",
+        )
+        duplicate = bool(ticket.pop("duplicate", False))
+        summary = etm_db.get_ticketing_summary(payload.bus_id, payload.trip_id, payload.route)
+        return JSONResponse(
+            status_code=200 if duplicate else 201,
+            content={
+                "success": True,
+                "ticket": ticket,
+                "summary": summary,
+                "duplicate": duplicate,
+            },
+        )
+    except etm_db.IdempotencyConflictError as conflict:
+        raise HTTPException(status_code=409, detail=str(conflict))
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Error issuing ticket: {e}")
+        raise HTTPException(status_code=500, detail="Failed to issue ticket.")
+
+
+@app.post("/api/conductor/tickets/{ticket_id}/cancel")
+def cancel_conductor_ticket(ticket_id: int):
+    try:
+        ticket = etm_db.cancel_ticket(ticket_id)
+        if not ticket:
+            raise HTTPException(status_code=404, detail=f"Ticket #{ticket_id} not found.")
+        summary = etm_db.get_ticketing_summary(ticket["bus_id"], ticket["trip_id"], ticket["route"])
+        return {"success": True, "ticket": ticket, "summary": summary}
+    except HTTPException:
+        raise
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Error cancelling ticket: {e}")
+        raise HTTPException(status_code=500, detail="Failed to cancel ticket.")
+
+
+@app.get("/api/conductor/passes")
+def get_conductor_passes(
+    bus_id: Optional[str] = Query(None),
+    trip_id: Optional[str] = Query(None),
+    route: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=500),
+):
+    try:
+        passes = etm_db.list_passes(
+            bus_id=bus_id,
+            trip_id=trip_id,
+            route=route,
+            status=status,
+            limit=limit,
+        )
+        return {"success": True, "passes": passes, "count": len(passes)}
+    except Exception as e:
+        logger.error(f"Error fetching passes: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve passes.")
+
+
+@app.post("/api/conductor/passes", status_code=201)
+def register_conductor_pass(payload: PassRegistrationRequest):
+    try:
+        passenger_pass = etm_db.register_pass(
+            bus_id=payload.bus_id,
+            route=payload.route,
+            trip_id=payload.trip_id,
+            conductor_id=payload.conductor_id or "",
+            pass_number=payload.pass_number or "",
+            pass_type=payload.pass_type,
+            passenger_count=payload.passenger_count,
+            valid_from=payload.valid_from or "",
+            valid_until=payload.valid_until or "",
+            boarding_stop=payload.boarding_stop or "",
+            destination_stop=payload.destination_stop or "",
+            notes=payload.notes or "",
+        )
+        summary = etm_db.get_ticketing_summary(payload.bus_id, payload.trip_id, payload.route)
+        return {"success": True, "pass": passenger_pass, "summary": summary}
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Error registering pass: {e}")
+        raise HTTPException(status_code=500, detail="Failed to register pass.")
+
+
+@app.post("/api/conductor/passes/{pass_id}/cancel")
+def cancel_conductor_pass(pass_id: int):
+    try:
+        passenger_pass = etm_db.cancel_pass(pass_id)
+        if not passenger_pass:
+            raise HTTPException(status_code=404, detail=f"Pass #{pass_id} not found.")
+        summary = etm_db.get_ticketing_summary(
+            passenger_pass["bus_id"],
+            passenger_pass["trip_id"],
+            passenger_pass["route"],
+        )
+        return {"success": True, "pass": passenger_pass, "summary": summary}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error cancelling pass: {e}")
+        raise HTTPException(status_code=500, detail="Failed to cancel pass.")
+
+
+@app.get("/api/conductor/ticketing/summary")
+def get_conductor_ticketing_summary(
+    bus_id: str = Query(..., min_length=1, max_length=50),
+    trip_id: str = Query(..., min_length=1, max_length=50),
+    route: Optional[str] = Query(""),
+):
+    try:
+        summary = etm_db.get_ticketing_summary(bus_id, trip_id, route or "")
+        return {"success": True, "summary": summary}
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Error fetching ticketing summary: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve ticketing summary.")
+
+
+@app.get("/api/analytics/passengers")
+def get_passenger_analytics(
+    days: int = Query(7, ge=1, le=365),
+    route: Optional[str] = Query(None),
+):
+    try:
+        analytics = etm_db.get_passenger_analytics(days=days, route=route)
+        return {"success": True, "analytics": analytics}
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Error building passenger analytics: {e}")
+        raise HTTPException(status_code=500, detail="Failed to build passenger analytics.")
+
+
+# ---------------------------------------------------------------------------
+# Checker dispatch and inspection endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/checkers")
+def get_checkers():
+    try:
+        checkers = alert_dispatch.list_checkers()
+        return {"success": True, "checkers": checkers, "count": len(checkers)}
+    except Exception as e:
+        logger.error(f"Error fetching checkers: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve checkers.")
+
+
+@app.get("/api/checker-dispatches")
+def get_checker_dispatches(
+    bus_id: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+):
+    try:
+        dispatches = alert_dispatch.list_dispatches(bus_id=bus_id, status=status, limit=limit)
+        return {"success": True, "dispatches": dispatches, "count": len(dispatches)}
+    except Exception as e:
+        logger.error(f"Error fetching dispatches: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve dispatches.")
+
+
+@app.post("/api/checker-dispatches", status_code=201)
+def create_checker_dispatch(payload: DispatchRequest):
+    try:
+        dispatch = alert_dispatch.create_manual_dispatch(
+            bus_id=payload.bus_id,
+            checker_id=payload.checker_id,
+            location=payload.location or "",
+            checkpoint=payload.checkpoint or "",
+            notes=payload.notes or "",
+            alert_id=payload.alert_id,
+            route=payload.route or "",
+            trip_id=payload.trip_id or "",
+        )
+        return {"success": True, "dispatch": dispatch}
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Error creating checker dispatch: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create checker dispatch.")
+
+
+@app.post("/api/checker-dispatches/{dispatch_id}/complete")
+def complete_checker_dispatch(dispatch_id: int, payload: DispatchCompletionRequest):
+    try:
+        dispatch = alert_dispatch.complete_dispatch(
+            dispatch_id=dispatch_id,
+            outcome=payload.outcome,
+            notes=payload.notes or "",
+            mismatch_confirmed=payload.mismatch_confirmed,
+        )
+        if not dispatch:
+            raise HTTPException(status_code=404, detail=f"Dispatch #{dispatch_id} not found.")
+        return {"success": True, "dispatch": dispatch}
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error completing checker dispatch: {e}")
+        raise HTTPException(status_code=500, detail="Failed to complete checker dispatch.")
+
+
+@app.get("/api/inspections")
+def get_inspections(
+    bus_id: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+):
+    try:
+        inspections = alert_dispatch.list_inspections(limit=limit, bus_id=bus_id, status=status)
+        return {"success": True, "inspections": inspections, "count": len(inspections)}
+    except Exception as e:
+        logger.error(f"Error fetching inspections: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve inspection history.")
 
 
 # ---------------------------------------------------------------------------

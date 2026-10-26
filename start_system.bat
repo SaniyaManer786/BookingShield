@@ -4,7 +4,7 @@ echo ========================================================
 echo  SMART ST Control Center - Starting Full Stack System
 echo ========================================================
 echo 1. Launching YOLO + OpenCV Backend on http://127.0.0.1:8001 ...
-start "SMART ST Vision Backend" cmd /k "python -m uvicorn backend.main:app --host 127.0.0.1 --port 8001"
+start "SMART ST Vision Backend" cmd /k call "%~dp0start_backend.bat"
 
 timeout /t 2 /nobreak >nul
 

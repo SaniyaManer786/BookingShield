@@ -97,6 +97,9 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 alert_code TEXT UNIQUE,
                 checkpoint_submission_id INTEGER UNIQUE,
+                bus_trip_id INTEGER,
+                expected_count_id INTEGER,
+                vision_count_id INTEGER,
                 bus_id TEXT NOT NULL,
                 route TEXT DEFAULT '',
                 trip_id TEXT DEFAULT '',
@@ -132,6 +135,7 @@ def init_db() -> None:
                 checker_id TEXT NOT NULL,
                 checker_name TEXT NOT NULL,
                 bus_id TEXT NOT NULL,
+                bus_trip_id INTEGER,
                 route TEXT DEFAULT '',
                 trip_id TEXT DEFAULT '',
                 checkpoint TEXT DEFAULT '',
@@ -142,8 +146,26 @@ def init_db() -> None:
             )
         """)
 
+        conductor_db.ensure_columns(cursor, "mismatch_alerts", [
+            ("bus_trip_id", "INTEGER"),
+            ("expected_count_id", "INTEGER"),
+            ("vision_count_id", "INTEGER"),
+        ])
+        conductor_db.ensure_columns(cursor, "checker_dispatches", [
+            ("alert_id", "INTEGER"),
+            ("bus_trip_id", "INTEGER"),
+            ("route", "TEXT DEFAULT ''"),
+            ("trip_id", "TEXT DEFAULT ''"),
+            ("checkpoint", "TEXT DEFAULT ''"),
+            ("outcome", "TEXT DEFAULT ''"),
+            ("findings", "TEXT DEFAULT ''"),
+            ("mismatch_confirmed", "INTEGER"),
+            ("completed_at", "TEXT DEFAULT ''"),
+        ])
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_alert_bus ON mismatch_alerts(bus_id, created_at DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_alert_trip_link ON mismatch_alerts(bus_trip_id, created_at DESC)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_dispatch_status ON checker_dispatches(status, created_at DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_dispatch_trip_link ON checker_dispatches(bus_trip_id, created_at DESC)")
 
         # Seed the checker roster once
         cursor.execute("SELECT COUNT(*) FROM checkers")
@@ -237,12 +259,15 @@ def process_checkpoint_record(record: Dict[str, Any]) -> Optional[Dict[str, Any]
 
         cursor.execute("""
             INSERT INTO mismatch_alerts
-            (alert_code, checkpoint_submission_id, bus_id, route, trip_id, checkpoint,
+            (alert_code, checkpoint_submission_id, bus_trip_id, expected_count_id, vision_count_id,
+             bus_id, route, trip_id, checkpoint,
              reported_passengers, expected_onboard, camera_estimate, difference,
              reported_difference, severity, status, source, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'New', 'checkpoint', ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'New', 'checkpoint', ?)
         """, (
-            alert_code, record_id, record.get("bus_id", ""), record.get("route", ""),
+            alert_code, record_id, record.get("bus_trip_id"), record.get("expected_count_id"),
+            record.get("vision_count_id"),
+            record.get("bus_id", ""), record.get("route", ""),
             record.get("trip_id", ""), record.get("checkpoint", ""),
             record.get("reported_passengers", 0), record.get("expected_onboard", 0),
             record.get("camera_estimate"), difference, record.get("reported_difference"),
@@ -291,11 +316,12 @@ def dispatch_checker_for_alert(alert: Dict[str, Any]) -> Optional[Dict[str, Any]
         now_iso = _now_iso()
         cursor.execute("""
             INSERT INTO checker_dispatches
-            (alert_id, checker_id, checker_name, bus_id, route, trip_id, checkpoint, location, status, notes, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Dispatched', ?, ?)
+            (alert_id, checker_id, checker_name, bus_id, bus_trip_id, route, trip_id, checkpoint, location, status, notes, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Dispatched', ?, ?)
         """, (
             alert_id, checker["id"], checker["name"], alert.get("bus_id", ""),
-            alert.get("route", ""), alert.get("trip_id", ""), alert.get("checkpoint", ""),
+            alert.get("bus_trip_id"), alert.get("route", ""), alert.get("trip_id", ""),
+            alert.get("checkpoint", ""),
             alert.get("checkpoint", "") or "Depot",
             "Camera count variance requires physical passenger verification.",
             now_iso
@@ -319,12 +345,23 @@ def create_manual_dispatch(
     checker_id: str,
     location: str = "",
     checkpoint: str = "",
-    notes: str = ""
+    notes: str = "",
+    alert_id: Optional[int] = None,
+    route: str = "",
+    trip_id: str = ""
 ) -> Dict[str, Any]:
     """Creates a manual checker assignment from the Checker Dispatch page."""
     bus_id = (bus_id or "").strip()
+    checker_id = (checker_id or "").strip()
+    location = (location or "").strip()
+    checkpoint = (checkpoint or "").strip()
+    notes = (notes or "Manual checker assignment.").strip()
+    route = (route or "").strip()
+    trip_id = (trip_id or "").strip()
     if not bus_id:
         raise ValueError("Bus registration number is required.")
+    if not checker_id:
+        raise ValueError("Checker is required.")
 
     conn = conductor_db.get_db_connection()
     try:
@@ -333,27 +370,110 @@ def create_manual_dispatch(
         checker = cursor.fetchone()
         if not checker:
             raise ValueError("Unknown checker identifier.")
+        if str(checker["availability"]).lower() != "available":
+            raise ValueError(f"Checker {checker['name']} is not available.")
+
+        bus_trip_id = None
+        mark_under_review = False
+        if alert_id is not None:
+            cursor.execute("SELECT * FROM mismatch_alerts WHERE id = ?", (alert_id,))
+            alert = cursor.fetchone()
+            if not alert:
+                raise ValueError("Unknown alert identifier.")
+            cursor.execute("SELECT id FROM checker_dispatches WHERE alert_id = ?", (alert_id,))
+            if cursor.fetchone():
+                raise ValueError("This alert already has a checker dispatch.")
+            bus_id = alert["bus_id"] or bus_id
+            route = alert["route"] or route
+            trip_id = alert["trip_id"] or trip_id
+            checkpoint = alert["checkpoint"] or checkpoint
+            bus_trip_id = alert["bus_trip_id"]
+            mark_under_review = alert["status"] == "New"
+
+        if bus_trip_id is None:
+            if not route or not trip_id:
+                bus = next(
+                    (row for row in conductor_db.get_registered_buses() if row["id"] == bus_id),
+                    None,
+                )
+                if not bus:
+                    raise ValueError("Unknown bus registration number.")
+                route = route or bus["route"]
+                trip_id = trip_id or bus["default_trip"]
+            trip = conductor_db.ensure_active_bus_trip(bus_id, route, trip_id)
+            bus_trip_id = trip["id"]
 
         now_iso = _now_iso()
+        if mark_under_review:
+            cursor.execute("UPDATE mismatch_alerts SET status = 'Under Review' WHERE id = ?", (alert_id,))
         cursor.execute("""
             INSERT INTO checker_dispatches
-            (alert_id, checker_id, checker_name, bus_id, route, trip_id, checkpoint, location, status, notes, created_at)
-            VALUES (NULL, ?, ?, ?, '', '', ?, ?, 'Dispatched', ?, ?)
+            (alert_id, checker_id, checker_name, bus_id, bus_trip_id, route, trip_id, checkpoint, location, status, notes, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Dispatched', ?, ?)
         """, (
-            checker["id"], checker["name"], bus_id, checkpoint, location,
-            (notes or "Manual checker assignment.").strip(), now_iso
+            alert_id, checker["id"], checker["name"], bus_id, bus_trip_id, route, trip_id,
+            checkpoint, location, notes, now_iso
         ))
         dispatch_id = cursor.lastrowid
 
         cursor.execute("""
             UPDATE checkers
-            SET availability = 'On inspection', bus_id = ?, task = 'Passenger check', updated_at = ?
+            SET availability = 'On inspection', bus_id = ?, location = COALESCE(NULLIF(?, ''), location),
+                task = 'Passenger check', updated_at = ?
             WHERE id = ?
-        """, (bus_id, now_iso, checker["id"]))
+        """, (bus_id, location, now_iso, checker["id"]))
         conn.commit()
     finally:
         conn.close()
 
+    return get_dispatch_by_id(dispatch_id)
+
+
+def complete_dispatch(
+    dispatch_id: int,
+    outcome: str,
+    notes: str = "",
+    mismatch_confirmed: Optional[bool] = None
+) -> Optional[Dict[str, Any]]:
+    """Completes an inspection and returns the checker to the available roster."""
+    outcome = (outcome or "").strip()
+    allowed = {"Mismatch Confirmed", "No Mismatch Found", "Inconclusive"}
+    if outcome not in allowed:
+        raise ValueError(f"Outcome must be one of: {', '.join(sorted(allowed))}.")
+    notes = (notes or "").strip()
+
+    conn = conductor_db.get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM checker_dispatches WHERE id = ?", (dispatch_id,))
+        dispatch = cursor.fetchone()
+        if not dispatch:
+            return None
+        if dispatch["status"] == "Completed":
+            raise ValueError("This inspection is already complete.")
+        if mismatch_confirmed is None:
+            mismatch_confirmed = outcome == "Mismatch Confirmed"
+
+        now_iso = _now_iso()
+        cursor.execute("""
+            UPDATE checker_dispatches
+            SET status = 'Completed', outcome = ?, findings = ?, mismatch_confirmed = ?,
+                completed_at = ?
+            WHERE id = ?
+        """, (outcome, notes, 1 if mismatch_confirmed else 0, now_iso, dispatch_id))
+        cursor.execute("""
+            UPDATE checkers
+            SET availability = 'Available', bus_id = '', task = 'Standby', updated_at = ?
+            WHERE id = ?
+        """, (now_iso, dispatch["checker_id"]))
+        if dispatch["alert_id"]:
+            cursor.execute(
+                "UPDATE mismatch_alerts SET status = 'Resolved' WHERE id = ?",
+                (dispatch["alert_id"],),
+            )
+        conn.commit()
+    finally:
+        conn.close()
     return get_dispatch_by_id(dispatch_id)
 
 
@@ -376,11 +496,16 @@ def get_alert_by_id(alert_id: int) -> Optional[Dict[str, Any]]:
 
 
 def get_dispatch_by_id(dispatch_id: int) -> Optional[Dict[str, Any]]:
-    """Returns a single checker dispatch record."""
+    """Returns a single checker dispatch record with alert context."""
     conn = conductor_db.get_db_connection()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM checker_dispatches WHERE id = ?", (dispatch_id,))
+        cursor.execute("""
+            SELECT d.*, a.alert_code, a.severity, a.status AS alert_status, a.route AS alert_route
+            FROM checker_dispatches d
+            LEFT JOIN mismatch_alerts a ON a.id = d.alert_id
+            WHERE d.id = ?
+        """, (dispatch_id,))
         row = cursor.fetchone()
         return dict(row) if row else None
     finally:
@@ -451,22 +576,26 @@ def update_alert_status(alert_id: int, status: str) -> Optional[Dict[str, Any]]:
 
 
 def list_dispatches(bus_id: Optional[str] = None, status: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
-    """Returns checker dispatches, newest first."""
+    """Returns checker dispatches, newest first, with alert context."""
     conn = conductor_db.get_db_connection()
     try:
         cursor = conn.cursor()
-        query = "SELECT * FROM checker_dispatches"
+        query = """
+            SELECT d.*, a.alert_code, a.severity, a.status AS alert_status, a.route AS alert_route
+            FROM checker_dispatches d
+            LEFT JOIN mismatch_alerts a ON a.id = d.alert_id
+        """
         conditions = []
         params: List[Any] = []
         if bus_id and bus_id.strip():
-            conditions.append("bus_id = ?")
+            conditions.append("d.bus_id = ?")
             params.append(bus_id.strip())
         if status and status.strip():
-            conditions.append("status = ?")
+            conditions.append("d.status = ?")
             params.append(status.strip())
         if conditions:
             query += " WHERE " + " AND ".join(conditions)
-        query += " ORDER BY created_at DESC, id DESC LIMIT ?"
+        query += " ORDER BY d.created_at DESC, d.id DESC LIMIT ?"
         params.append(max(1, min(int(limit), 500)))
         cursor.execute(query, tuple(params))
         return [dict(row) for row in cursor.fetchall()]
@@ -485,47 +614,64 @@ def list_checkers() -> List[Dict[str, Any]]:
         conn.close()
 
 
-def list_inspections(limit: int = 100) -> List[Dict[str, Any]]:
-    """
-    Returns the inspection activity log built from dispatches and seed records.
-
-    The Inspection History page reads this so completed checker visits keep
-    working after dispatches are stored in the database.
-    """
-    seed_history = [
-        {"inspection_id": "INSP-6018", "bus_id": "MH-14-BT-1906", "route": "Pune – Nashik", "checker": "Pravin Deshmukh", "location": "Sangamner Bus Stand", "mismatch": "No", "outcome": "No Mismatch Found"},
-        {"inspection_id": "INSP-6017", "bus_id": "MH-11-AX-2208", "route": "Pune – Solapur", "checker": "Meena Patil", "location": "Indapur Bypass", "mismatch": "Yes · 2", "outcome": "Mismatch Confirmed"},
-        {"inspection_id": "INSP-6016", "bus_id": "MH-09-CV-3372", "route": "Pune – Kolhapur", "checker": "Rahul Gaikwad", "location": "Karad Bus Stand", "mismatch": "Pending", "outcome": "Inspection Pending"},
-        {"inspection_id": "INSP-6015", "bus_id": "MH-12-KL-2811", "route": "Pune – Satara", "checker": "Sunita More", "location": "Shirwal Checkpoint", "mismatch": "No", "outcome": "No Mismatch Found"},
-        {"inspection_id": "INSP-6014", "bus_id": "MH-12-QW-4821", "route": "Pune – Mumbai", "checker": "Ajay Jadhav", "location": "Lonavala Depot", "mismatch": "Yes · 1", "outcome": "Mismatch Confirmed"},
-    ]
-
+def list_inspections(
+    limit: int = 100,
+    bus_id: Optional[str] = None,
+    status: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Returns the inspection activity log built from real checker dispatches."""
     conn = conductor_db.get_db_connection()
     try:
         cursor = conn.cursor()
-        cursor.execute("""
-            SELECT d.*, a.route AS alert_route, a.severity
+        query = """
+            SELECT d.*, a.alert_code, a.severity, a.status AS alert_status,
+                   a.route AS alert_route, a.difference AS alert_difference
             FROM checker_dispatches d
             LEFT JOIN mismatch_alerts a ON a.id = d.alert_id
-            ORDER BY d.created_at DESC, d.id DESC LIMIT ?
-        """, (max(1, min(int(limit), 500)),))
+        """
+        conditions: List[str] = []
+        params: List[Any] = []
+        if bus_id and bus_id.strip():
+            conditions.append("d.bus_id = ?")
+            params.append(bus_id.strip())
+        if status and status.strip():
+            conditions.append("d.status = ?")
+            params.append(status.strip())
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY d.created_at DESC, d.id DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 500)))
+        cursor.execute(query, tuple(params))
         rows = [dict(row) for row in cursor.fetchall()]
     finally:
         conn.close()
 
     history = []
-    for index, row in enumerate(rows):
+    for row in rows:
+        pending = row.get("status") != "Completed"
+        variance = row.get("alert_difference")
+        if pending:
+            mismatch = "Pending"
+        elif row.get("mismatch_confirmed"):
+            mismatch = f"Yes · {abs(int(variance or 0))}" if variance is not None else "Yes"
+        else:
+            mismatch = "No"
         history.append({
-            "inspection_id": f"INSP-{7000 + index}",
+            "inspection_id": f"INSP-{int(row['id']):05d}",
+            "dispatch_id": row["id"],
             "bus_id": row.get("bus_id", ""),
             "route": row.get("alert_route") or row.get("route", ""),
             "checker": row.get("checker_name", ""),
+            "checker_id": row.get("checker_id", ""),
             "location": row.get("location", ""),
-            "mismatch": "Pending" if row.get("status") == "Dispatched" else "Yes",
-            "outcome": "Inspection Pending" if row.get("status") == "Dispatched" else "Mismatch Verified",
+            "checkpoint": row.get("checkpoint", ""),
+            "mismatch": mismatch,
+            "outcome": row.get("outcome") or ("Inspection Pending" if pending else "Completed"),
+            "findings": row.get("findings", ""),
+            "status": row.get("status", ""),
+            "alert_code": row.get("alert_code", ""),
+            "severity": row.get("severity", ""),
             "created_at": row.get("created_at", ""),
+            "completed_at": row.get("completed_at", ""),
         })
-    return history + [
-        {**item, "created_at": _iso_minutes_ago(30 + index * 20)}
-        for index, item in enumerate(seed_history)
-    ]
+    return history

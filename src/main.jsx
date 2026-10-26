@@ -7,7 +7,7 @@ const navigation = [
   ["Live Bus Monitoring", "⌖", "12"],
   ["Computer Vision Monitoring", "📷", "YOLO"],
   ["Conductor Panel", "🎫", "Active"],
-  ["Mismatch Alerts", "⚑", "4"],
+  ["Mismatch Alerts", "⚑"],
   ["Bus & Route Management", "▤"],
   ["Passenger Analytics", "⌁"],
   ["Checker Dispatch", "♙"],
@@ -55,12 +55,16 @@ function App() {
               >
                 <span className="nav-icon">{icon}</span>
                 <span>{name}</span>
-                {count && (
+                {name === "Mismatch Alerts" ? (
                   <span
-                    className={`nav-count${name === "Mismatch Alerts" ? " alert-count" : ""}`}
+                    className="nav-count alert-count"
+                    id="navAlertCount"
+                    hidden
                   >
-                    {count}
+                    0
                   </span>
+                ) : (
+                  count && <span className="nav-count">{count}</span>
                 )}
               </button>
             ))}
@@ -74,8 +78,8 @@ function App() {
           </nav>
           <div className="sidebar-footer">
             <div className="online-dot" />
-            <span>Demo environment</span>
-            <span className="footer-version">v1.0</span>
+            <span>Local backend</span>
+            <span className="footer-version">v1.19.4</span>
           </div>
         </aside>
 
@@ -132,7 +136,7 @@ function App() {
           <section className="content" id="pageContent" aria-live="polite" />
           <footer className="app-footer">
             <span>SMART ST Control Center</span>
-            <span>Demonstration data · Not connected to live systems</span>
+            <span>Backend-connected workflows · sample pages remain labelled</span>
           </footer>
         </main>
       </div>

@@ -4,6 +4,7 @@ SQLite-backed storage for conductor passenger accounting and real-time detection
 """
 
 import os
+import re
 import sqlite3
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
@@ -101,6 +102,29 @@ MAX_PASSENGER_COUNT = 500
 
 # A camera count older than this many seconds is reported as stale, not current.
 CAMERA_COUNT_STALE_SECONDS = 20
+
+TRIP_STATUSES = {"Active", "Completed", "Cancelled"}
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _clean_identifier(value: Any, field: str, max_length: int = 50) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{field} is required.")
+    if len(text) > max_length:
+        raise ValueError(f"{field} must be at most {max_length} characters.")
+    return text
+
+
+def _route_key(value: Any) -> str:
+    """Normalises route names for comparison while preserving stored values."""
+    text = str(value or "").strip().casefold()
+    for dash in ("\u2013", "\u2014", "\u2212"):
+        text = text.replace(dash, "-")
+    return " ".join(text.split()).replace(" - ", "-")
 
 
 def get_db_connection() -> sqlite3.Connection:
@@ -238,6 +262,86 @@ def init_db():
             )
         """)
 
+        # Bus trip lifecycle. One bus may only have one Active trip at a time.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS bus_trips (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trip_id TEXT NOT NULL,
+                bus_id TEXT NOT NULL,
+                route TEXT NOT NULL,
+                conductor_id TEXT DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'Active',
+                started_at TEXT NOT NULL,
+                ended_at TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        cursor.execute("DROP INDEX IF EXISTS idx_bus_trip_active")
+        cursor.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_bus_trips_one_active
+            ON bus_trips(bus_id) WHERE status = 'Active'
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_bus_trips_bus_trip
+            ON bus_trips(bus_id, trip_id, started_at DESC)
+        """)
+
+        # Append-only expected passenger count for each checkpoint calculation.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS expected_passenger_counts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bus_trip_id INTEGER NOT NULL,
+                checkpoint_submission_id INTEGER UNIQUE,
+                bus_id TEXT NOT NULL,
+                route TEXT NOT NULL,
+                trip_id TEXT NOT NULL,
+                checkpoint TEXT DEFAULT '',
+                starting_onboard INTEGER NOT NULL DEFAULT 0,
+                boarded INTEGER NOT NULL DEFAULT 0,
+                alighted INTEGER NOT NULL DEFAULT 0,
+                expected_count INTEGER NOT NULL,
+                reported_count INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_expected_counts_bus_trip
+            ON expected_passenger_counts(bus_trip_id, created_at DESC)
+        """)
+
+        # Computer-vision snapshot attached to a checkpoint. Live detection
+        # state remains in latest_detections; this table is the trip audit trail.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS computer_vision_counts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bus_trip_id INTEGER NOT NULL,
+                checkpoint_submission_id INTEGER,
+                bus_id TEXT NOT NULL,
+                route TEXT NOT NULL,
+                trip_id TEXT NOT NULL,
+                checkpoint TEXT DEFAULT '',
+                detected_count INTEGER NOT NULL,
+                inference_time_ms REAL NOT NULL DEFAULT 0.0,
+                camera_status TEXT DEFAULT '',
+                captured_at TEXT DEFAULT '',
+                created_at TEXT NOT NULL
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_vision_counts_bus_trip
+            ON computer_vision_counts(bus_trip_id, created_at DESC)
+        """)
+
+        ensure_columns(cursor, "conductor_records", [
+            ("bus_trip_id", "INTEGER"),
+        ])
+        ensure_columns(cursor, "latest_detections", [
+            ("bus_trip_id", "INTEGER"),
+            ("trip_id", "TEXT DEFAULT ''"),
+            ("route", "TEXT DEFAULT ''"),
+        ])
+
         # Checkpoint submissions table (persistent checkpoint-by-checkpoint audit trail)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS checkpoint_submissions (
@@ -272,6 +376,7 @@ def init_db():
             cursor.execute("ALTER TABLE checkpoint_submissions ADD COLUMN camera_detection_time TEXT DEFAULT ''")
 
         ensure_columns(cursor, "checkpoint_submissions", [
+            ("bus_trip_id", "INTEGER"),
             ("period_start", "TEXT DEFAULT ''"),
             ("period_end", "TEXT DEFAULT ''"),
             ("camera_status", "TEXT DEFAULT ''"),
@@ -279,6 +384,12 @@ def init_db():
             ("difference_abs", "INTEGER"),
             ("alert_id", "INTEGER"),
             ("source", "TEXT DEFAULT 'conductor_panel'"),
+            ("ticket_count", "INTEGER DEFAULT 0"),
+            ("ticket_passengers", "INTEGER DEFAULT 0"),
+            ("pass_count", "INTEGER DEFAULT 0"),
+            ("pass_passengers", "INTEGER DEFAULT 0"),
+            ("ticket_revenue", "REAL DEFAULT 0.0"),
+            ("ticketing_source", "TEXT DEFAULT 'manual'"),
         ])
 
         # Populate registered buses if empty
@@ -295,6 +406,331 @@ def init_db():
                 ))
 
         conn.commit()
+    finally:
+        conn.close()
+
+
+def _registered_bus(cursor: sqlite3.Cursor, bus_id: str) -> Dict[str, Any]:
+    cursor.execute("SELECT * FROM registered_buses WHERE id = ?", (bus_id,))
+    row = cursor.fetchone()
+    if not row:
+        raise ValueError(f"Unknown bus registration number: {bus_id}.")
+    return dict(row)
+
+
+def _validate_trip_details(
+    cursor: sqlite3.Cursor,
+    bus_id: str,
+    route: str,
+    trip_id: str,
+    conductor_id: str = "",
+) -> tuple:
+    bus_id = _clean_identifier(bus_id, "Bus registration number")
+    route = _clean_identifier(route, "Route", max_length=100)
+    trip_id = _clean_identifier(trip_id, "Trip identifier")
+    conductor_id = str(conductor_id or "").strip()
+    if len(conductor_id) > 100:
+        raise ValueError("Conductor must be at most 100 characters.")
+    bus = _registered_bus(cursor, bus_id)
+    if _route_key(route) != _route_key(bus["route"]):
+        raise ValueError(
+            f"Route '{route}' does not match the registered route for bus {bus_id}."
+        )
+    return bus_id, route, trip_id, conductor_id
+
+
+def start_bus_trip(
+    bus_id: str,
+    route: str,
+    trip_id: str,
+    conductor_id: str = "",
+) -> Dict[str, Any]:
+    """
+    Starts an Active trip for a registered bus.
+
+    Idempotent for the same bus/trip. A bus cannot have two Active trips, and
+    the route must match the bus registration.
+    """
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        bus_id, route, trip_id, conductor_id = _validate_trip_details(
+            cursor, bus_id, route, trip_id, conductor_id
+        )
+        cursor.execute(
+            "SELECT * FROM bus_trips WHERE bus_id = ? AND status = 'Active' ORDER BY id DESC LIMIT 1",
+            (bus_id,),
+        )
+        active = cursor.fetchone()
+        if active:
+            if active["trip_id"] != trip_id:
+                raise ValueError(
+                    f"Bus {bus_id} already has an active trip ({active['trip_id']}). "
+                    "Complete it before starting another trip."
+                )
+            if _route_key(active["route"]) != _route_key(route):
+                raise ValueError(
+                    f"Active trip {trip_id} belongs to route '{active['route']}', not '{route}'."
+                )
+            if conductor_id and not active["conductor_id"]:
+                cursor.execute(
+                    "UPDATE bus_trips SET conductor_id = ?, updated_at = ? WHERE id = ?",
+                    (conductor_id, _now_iso(), active["id"]),
+                )
+                conn.commit()
+                cursor.execute("SELECT * FROM bus_trips WHERE id = ?", (active["id"],))
+                return dict(cursor.fetchone())
+            return dict(active)
+
+        now_iso = _now_iso()
+        try:
+            cursor.execute("""
+                INSERT INTO bus_trips
+                (trip_id, bus_id, route, conductor_id, status, started_at, ended_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'Active', ?, '', ?, ?)
+            """, (trip_id, bus_id, route, conductor_id, now_iso, now_iso, now_iso))
+            trip_record_id = cursor.lastrowid
+            conn.commit()
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            cursor.execute(
+                "SELECT * FROM bus_trips WHERE bus_id = ? AND status = 'Active' ORDER BY id DESC LIMIT 1",
+                (bus_id,),
+            )
+            active = cursor.fetchone()
+            if active and active["trip_id"] == trip_id:
+                return dict(active)
+            raise ValueError(f"Bus {bus_id} already has an active trip.") from None
+    finally:
+        conn.close()
+    return get_bus_trip_by_id(trip_record_id) or {}
+
+
+def ensure_active_bus_trip(
+    bus_id: str,
+    route: str,
+    trip_id: str,
+    conductor_id: str = "",
+) -> Dict[str, Any]:
+    """Returns the matching Active trip, starting one when the bus has none."""
+    bus_id = _clean_identifier(bus_id, "Bus registration number")
+    trip_id = _clean_identifier(trip_id, "Trip identifier")
+    active = get_active_bus_trip(bus_id)
+    if active:
+        if active["trip_id"] != trip_id:
+            raise ValueError(
+                f"Bus {bus_id} is active on trip {active['trip_id']}, not {trip_id}."
+            )
+        if _route_key(active["route"]) != _route_key(route):
+            raise ValueError(
+                f"Active trip {trip_id} belongs to route '{active['route']}', not '{route}'."
+            )
+        return active
+    return start_bus_trip(bus_id, route, trip_id, conductor_id)
+
+
+def get_bus_trip_by_id(trip_record_id: int) -> Optional[Dict[str, Any]]:
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM bus_trips WHERE id = ?", (trip_record_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_active_bus_trip(bus_id: str) -> Optional[Dict[str, Any]]:
+    bus_id = str(bus_id or "").strip()
+    if not bus_id:
+        return None
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM bus_trips WHERE bus_id = ? AND status = 'Active' ORDER BY id DESC LIMIT 1",
+            (bus_id,),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def list_bus_trips(
+    bus_id: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        query = "SELECT * FROM bus_trips"
+        conditions: List[str] = []
+        params: List[Any] = []
+        if bus_id and bus_id.strip():
+            conditions.append("bus_id = ?")
+            params.append(bus_id.strip())
+        if status and status.strip():
+            status = status.strip().title()
+            if status not in TRIP_STATUSES:
+                raise ValueError(f"Status must be one of: {', '.join(sorted(TRIP_STATUSES))}.")
+            conditions.append("status = ?")
+            params.append(status)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY CASE status WHEN 'Active' THEN 0 ELSE 1 END, started_at DESC, id DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 500)))
+        cursor.execute(query, tuple(params))
+        return [dict(row) for row in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def complete_bus_trip(
+    trip_record_id: Optional[int] = None,
+    bus_id: Optional[str] = None,
+    trip_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Marks a trip Completed. Repeating completion is idempotent."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        if trip_record_id is not None:
+            cursor.execute("SELECT * FROM bus_trips WHERE id = ?", (trip_record_id,))
+            trip = cursor.fetchone()
+        else:
+            bus_id = str(bus_id or "").strip()
+            trip_id = str(trip_id or "").strip()
+            if not bus_id or not trip_id:
+                raise ValueError("trip record id or bus_id and trip_id are required.")
+            cursor.execute("""
+                SELECT * FROM bus_trips
+                WHERE bus_id = ? AND trip_id = ?
+                ORDER BY CASE status WHEN 'Active' THEN 0 ELSE 1 END, id DESC LIMIT 1
+            """, (bus_id, trip_id))
+            trip = cursor.fetchone()
+        if not trip:
+            raise ValueError("Trip not found.")
+        if trip["status"] == "Completed":
+            return dict(trip)
+        if trip["status"] == "Cancelled":
+            raise ValueError("Cancelled trips cannot be completed.")
+        now_iso = _now_iso()
+        cursor.execute(
+            "UPDATE bus_trips SET status = 'Completed', ended_at = ?, updated_at = ? WHERE id = ?",
+            (now_iso, now_iso, trip["id"]),
+        )
+        conn.commit()
+        cursor.execute("SELECT * FROM bus_trips WHERE id = ?", (trip["id"],))
+        return dict(cursor.fetchone())
+    finally:
+        conn.close()
+
+
+def get_trip_summary(trip_record_id: int) -> Dict[str, Any]:
+    """Returns persisted ETM, occupancy, camera and mismatch totals for a trip."""
+    trip = get_bus_trip_by_id(trip_record_id)
+    if not trip:
+        raise ValueError("Trip not found.")
+
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        summary: Dict[str, Any] = {
+            "trip": trip,
+            "ticket_count": 0,
+            "ticket_passengers": 0,
+            "pass_count": 0,
+            "pass_passengers": 0,
+            "checkpoint_count": 0,
+            "expected_count": 0,
+            "vision_count": 0,
+            "mismatch_count": 0,
+            "latest_expected_count": None,
+            "latest_reported_count": None,
+            "latest_vision_count": None,
+            "latest_difference": None,
+            "passenger_categories": [],
+        }
+        try:
+            cursor.execute("""
+                SELECT COUNT(*) AS ticket_count, COALESCE(SUM(total_passengers), 0) AS passengers
+                FROM tickets WHERE bus_trip_id = ? AND status = 'Valid'
+            """, (trip_record_id,))
+            row = cursor.fetchone()
+            summary["ticket_count"] = int(row["ticket_count"] or 0)
+            summary["ticket_passengers"] = int(row["passengers"] or 0)
+        except sqlite3.OperationalError:
+            pass
+        try:
+            cursor.execute("""
+                SELECT COUNT(*) AS pass_count, COALESCE(SUM(passenger_count), 0) AS passengers
+                FROM pass_registrations
+                WHERE bus_trip_id = ? AND status = 'Valid'
+                  AND (valid_from = '' OR date(valid_from) <= date('now'))
+                  AND (valid_until = '' OR date(valid_until) >= date('now'))
+            """, (trip_record_id,))
+            row = cursor.fetchone()
+            summary["pass_count"] = int(row["pass_count"] or 0)
+            summary["pass_passengers"] = int(row["passengers"] or 0)
+        except sqlite3.OperationalError:
+            pass
+        cursor.execute(
+            "SELECT COUNT(*) FROM checkpoint_submissions WHERE bus_trip_id = ?",
+            (trip_record_id,),
+        )
+        summary["checkpoint_count"] = int(cursor.fetchone()[0] or 0)
+        cursor.execute(
+            "SELECT COUNT(*) FROM expected_passenger_counts WHERE bus_trip_id = ?",
+            (trip_record_id,),
+        )
+        summary["expected_count"] = int(cursor.fetchone()[0] or 0)
+        cursor.execute(
+            "SELECT COUNT(*) FROM computer_vision_counts WHERE bus_trip_id = ?",
+            (trip_record_id,),
+        )
+        summary["vision_count"] = int(cursor.fetchone()[0] or 0)
+        try:
+            cursor.execute(
+                "SELECT COUNT(*) FROM mismatch_alerts WHERE bus_trip_id = ?",
+                (trip_record_id,),
+            )
+            summary["mismatch_count"] = int(cursor.fetchone()[0] or 0)
+        except sqlite3.OperationalError:
+            pass
+        cursor.execute("""
+            SELECT expected_count, reported_count
+            FROM expected_passenger_counts
+            WHERE bus_trip_id = ? ORDER BY id DESC LIMIT 1
+        """, (trip_record_id,))
+        row = cursor.fetchone()
+        if row:
+            summary["latest_expected_count"] = int(row["expected_count"])
+            summary["latest_reported_count"] = int(row["reported_count"])
+        cursor.execute("""
+            SELECT detected_count FROM computer_vision_counts
+            WHERE bus_trip_id = ? ORDER BY id DESC LIMIT 1
+        """, (trip_record_id,))
+        row = cursor.fetchone()
+        if row:
+            summary["latest_vision_count"] = int(row["detected_count"])
+            if summary["latest_reported_count"] is not None:
+                summary["latest_difference"] = (
+                    summary["latest_reported_count"] - summary["latest_vision_count"]
+                )
+        try:
+            cursor.execute("""
+                SELECT category_code, SUM(passenger_count) AS passengers,
+                       SUM(line_total) AS revenue
+                FROM ticket_passenger_categories
+                WHERE ticket_id IN (SELECT id FROM tickets WHERE bus_trip_id = ?)
+                GROUP BY category_code ORDER BY category_code
+            """, (trip_record_id,))
+            summary["passenger_categories"] = [dict(row) for row in cursor.fetchall()]
+        except sqlite3.OperationalError:
+            pass
+        return summary
     finally:
         conn.close()
 
@@ -337,18 +773,25 @@ def save_conductor_counts(
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id FROM bus_trips WHERE bus_id = ? AND trip_id = ? AND status = 'Active' ORDER BY id DESC LIMIT 1",
+            (bus_id, trip_id),
+        )
+        trip_row = cursor.fetchone()
+        bus_trip_id = trip_row["id"] if trip_row else None
         cursor.execute("""
             INSERT INTO conductor_records
-            (bus_id, trip_id, active_tickets, valid_passes, total_reported, notes, conductor_name, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (bus_id, trip_id, active_tickets, valid_passes, total_reported, notes, conductor_name, bus_trip_id, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(bus_id, trip_id) DO UPDATE SET
                 active_tickets = excluded.active_tickets,
                 valid_passes = excluded.valid_passes,
                 total_reported = excluded.total_reported,
                 notes = excluded.notes,
                 conductor_name = excluded.conductor_name,
+                bus_trip_id = COALESCE(excluded.bus_trip_id, conductor_records.bus_trip_id),
                 updated_at = excluded.updated_at
-        """, (bus_id, trip_id, active_tickets, valid_passes, total_reported, notes.strip(), conductor_name.strip(), now_iso))
+        """, (bus_id, trip_id, active_tickets, valid_passes, total_reported, notes.strip(), conductor_name.strip(), bus_trip_id, now_iso))
         conn.commit()
 
         return {
@@ -359,6 +802,7 @@ def save_conductor_counts(
             "total_reported": total_reported,
             "notes": notes.strip(),
             "conductor_name": conductor_name.strip(),
+            "bus_trip_id": bus_trip_id,
             "updated_at": now_iso
         }
     finally:
@@ -393,20 +837,38 @@ def record_latest_detection(bus_id: str, count: int, inference_time_ms: float = 
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM bus_trips WHERE bus_id = ? AND status = 'Active' ORDER BY id DESC LIMIT 1",
+            (bus_id,),
+        )
+        trip = cursor.fetchone()
         cursor.execute("""
-            INSERT INTO latest_detections (bus_id, detected_count, inference_time_ms, updated_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO latest_detections
+            (bus_id, detected_count, inference_time_ms, bus_trip_id, trip_id, route, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(bus_id) DO UPDATE SET
                 detected_count = excluded.detected_count,
                 inference_time_ms = excluded.inference_time_ms,
+                bus_trip_id = excluded.bus_trip_id,
+                trip_id = excluded.trip_id,
+                route = excluded.route,
                 updated_at = excluded.updated_at
-        """, (bus_id, count, inference_time_ms, now_iso))
+        """, (
+            bus_id, count, inference_time_ms,
+            trip["id"] if trip else None,
+            trip["trip_id"] if trip else "",
+            trip["route"] if trip else "",
+            now_iso,
+        ))
         conn.commit()
 
         return {
             "bus_id": bus_id,
             "detected_count": count,
             "inference_time_ms": inference_time_ms,
+            "bus_trip_id": trip["id"] if trip else None,
+            "trip_id": trip["trip_id"] if trip else "",
+            "route": trip["route"] if trip else "",
             "updated_at": now_iso
         }
     finally:
@@ -521,7 +983,8 @@ def save_checkpoint_submission(
     period_start: Optional[str] = None,
     period_end: Optional[str] = None,
     source: str = "conductor_panel",
-    skip_camera_lookup: bool = False
+    skip_camera_lookup: bool = False,
+    use_ticketing_totals: bool = True
 ) -> Dict[str, Any]:
     """
     Saves a persistent checkpoint submission record for SMART ST Conductor Panel.
@@ -564,6 +1027,33 @@ def save_checkpoint_submission(
             raise ValueError(f"{name} cannot be negative.")
         if val > MAX_PASSENGER_COUNT:
             raise ValueError(f"{name} exceeds reasonable limit ({MAX_PASSENGER_COUNT}).")
+
+    trip = ensure_active_bus_trip(bus_id, route, trip_id, conductor_id)
+    bus_trip_id = trip["id"]
+
+    ticket_summary: Optional[Dict[str, Any]] = None
+    ticketing_source = "manual"
+    if use_ticketing_totals:
+        try:
+            try:
+                from . import etm_db
+            except ImportError:
+                import etm_db  # type: ignore
+            summary = etm_db.get_ticketing_summary(bus_id, trip_id, route)
+            if summary.get("ticket_count") or summary.get("pass_count"):
+                active_tickets = int(summary.get("ticket_passengers") or 0)
+                valid_passes = int(summary.get("pass_passengers") or 0)
+                if active_tickets > MAX_PASSENGER_COUNT:
+                    raise ValueError(f"ETM ticket passengers exceed reasonable limit ({MAX_PASSENGER_COUNT}).")
+                if valid_passes > MAX_PASSENGER_COUNT:
+                    raise ValueError(f"ETM pass passengers exceed reasonable limit ({MAX_PASSENGER_COUNT}).")
+                ticket_summary = summary
+                ticketing_source = "etm"
+        except ValueError:
+            raise
+        except Exception:
+            ticket_summary = None
+            ticketing_source = "manual"
 
     # Resolve latest camera detection if not explicitly passed. Callers that
     # know the camera is offline/stale pass skip_camera_lookup=True so a stale
@@ -616,45 +1106,82 @@ def save_checkpoint_submission(
         cursor = conn.cursor()
         cursor.execute("""
             INSERT INTO checkpoint_submissions (
-                bus_id, route, trip_id, checkpoint, conductor_id,
+                bus_trip_id, bus_id, route, trip_id, checkpoint, conductor_id,
                 active_tickets, valid_passes, other_authorized,
                 starting_onboard, boarded, alighted,
                 reported_passengers, expected_onboard,
                 camera_estimate, camera_detection_time,
                 difference, difference_abs, reported_difference,
                 comparison_status, camera_status, period_start, period_end, source,
+                ticket_count, ticket_passengers, pass_count, pass_passengers,
+                ticket_revenue, ticketing_source,
                 notes, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            bus_id, route, trip_id, checkpoint, conductor_id,
+            bus_trip_id, bus_id, route, trip_id, checkpoint, conductor_id,
             active_tickets, valid_passes, other_authorized,
             starting_onboard, boarded, alighted,
             reported_passengers, expected_onboard,
             camera_estimate, camera_detection_time or "",
             difference, difference_abs, reported_difference,
             comparison_status, camera_status, period_start_iso, period_end_iso, source,
+            (ticket_summary or {}).get("ticket_count", 0),
+            (ticket_summary or {}).get("ticket_passengers", 0),
+            (ticket_summary or {}).get("pass_count", 0),
+            (ticket_summary or {}).get("pass_passengers", 0),
+            (ticket_summary or {}).get("ticket_revenue", 0.0),
+            ticketing_source,
             notes, now_iso
         ))
         record_id = cursor.lastrowid
 
+        cursor.execute("""
+            INSERT INTO expected_passenger_counts
+            (bus_trip_id, checkpoint_submission_id, bus_id, route, trip_id, checkpoint,
+             starting_onboard, boarded, alighted, expected_count, reported_count, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            bus_trip_id, record_id, bus_id, route, trip_id, checkpoint,
+            starting_onboard, boarded, alighted, expected_onboard, reported_passengers, now_iso,
+        ))
+        expected_count_id = cursor.lastrowid
+        vision_count_id = None
+        if camera_estimate is not None:
+            inference_time_ms = float((detection_snapshot or {}).get("inference_time_ms") or 0.0)
+            cursor.execute("""
+                INSERT INTO computer_vision_counts
+                (bus_trip_id, checkpoint_submission_id, bus_id, route, trip_id, checkpoint,
+                 detected_count, inference_time_ms, camera_status, captured_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                bus_trip_id, record_id, bus_id, route, trip_id, checkpoint,
+                camera_estimate, inference_time_ms, camera_status,
+                camera_detection_time or now_iso, now_iso,
+            ))
+            vision_count_id = cursor.lastrowid
+
         # Also sync latest values into conductor_records table for existing dashboard views
         cursor.execute("""
             INSERT INTO conductor_records
-            (bus_id, trip_id, active_tickets, valid_passes, total_reported, notes, conductor_name, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (bus_id, trip_id, active_tickets, valid_passes, total_reported, notes, conductor_name, bus_trip_id, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(bus_id, trip_id) DO UPDATE SET
                 active_tickets = excluded.active_tickets,
                 valid_passes = excluded.valid_passes,
                 total_reported = excluded.total_reported,
                 notes = excluded.notes,
                 conductor_name = excluded.conductor_name,
+                bus_trip_id = excluded.bus_trip_id,
                 updated_at = excluded.updated_at
-        """, (bus_id, trip_id, active_tickets, valid_passes, reported_passengers, notes, conductor_id, now_iso))
+        """, (bus_id, trip_id, active_tickets, valid_passes, reported_passengers, notes, conductor_id, bus_trip_id, now_iso))
 
         conn.commit()
 
         return {
             "id": record_id,
+            "bus_trip_id": bus_trip_id,
+            "expected_count_id": expected_count_id,
+            "vision_count_id": vision_count_id,
             "bus_id": bus_id,
             "route": route,
             "trip_id": trip_id,
@@ -679,6 +1206,13 @@ def save_checkpoint_submission(
             "period_start": period_start_iso,
             "period_end": period_end_iso,
             "source": source,
+            "ticket_count": (ticket_summary or {}).get("ticket_count", 0),
+            "ticket_passengers": (ticket_summary or {}).get("ticket_passengers", 0),
+            "pass_count": (ticket_summary or {}).get("pass_count", 0),
+            "pass_passengers": (ticket_summary or {}).get("pass_passengers", 0),
+            "ticket_revenue": (ticket_summary or {}).get("ticket_revenue", 0.0),
+            "ticketing_source": ticketing_source,
+            "ticket_summary": ticket_summary,
             "notes": notes,
             "created_at": now_iso
         }
@@ -841,6 +1375,27 @@ def get_checkpoint_options(route: Optional[str] = None, bus_id: Optional[str] = 
         return [row[0] for row in cursor.fetchall()]
     finally:
         conn.close()
+
+
+def get_route_stops(route: str, bus_id: Optional[str] = None) -> List[str]:
+    """Returns route endpoints plus checkpoints already recorded for the route."""
+    route = _clean_identifier(route, "Route", max_length=100)
+    stops = [
+        part.strip()
+        for part in re.split(r"\s+[-\u2013\u2014]\s+", route)
+        if part.strip()
+    ]
+    stops.extend(get_checkpoint_options(route=route, bus_id=bus_id))
+
+    unique_stops: List[str] = []
+    seen = set()
+    for stop in stops:
+        key = stop.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_stops.append(stop)
+    return unique_stops
 
 
 def record_camera_session(

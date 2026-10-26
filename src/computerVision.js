@@ -44,6 +44,55 @@ function relativeTime(value) {
 let unsubscribe = null;
 let releaseConsumer = null;
 let registeredBuses = [];
+let monitoringStartedAt = null;
+let peakCount = 0;
+let lastLoggedDetectionAt = null;
+let lastLoggedCount = null;
+let lastLogWallClock = 0;
+let detectionLog = [];
+let resizeHandler = null;
+let wasStreaming = false;
+
+function resetSessionMetrics() {
+  monitoringStartedAt = new Date();
+  peakCount = 0;
+  lastLoggedDetectionAt = null;
+  lastLoggedCount = null;
+  lastLogWallClock = 0;
+  detectionLog = [];
+}
+
+function formatClock(value) {
+  if (!value) return "—";
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return "—";
+  return date.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+}
+
+function busForId(busId) {
+  return registeredBuses.find((bus) => bus.id === busId);
+}
+
+function renderDetectionFeed() {
+  const feed = document.getElementById("cvDetectionFeed");
+  const count = document.getElementById("cvFeedCount");
+  if (count) count.textContent = `${detectionLog.length} event${detectionLog.length === 1 ? "" : "s"}`;
+  if (!feed) return;
+  if (!detectionLog.length) {
+    feed.innerHTML = `<div class="cv-feed-empty">Detection events will appear after the camera starts.</div>`;
+    return;
+  }
+  feed.innerHTML = detectionLog
+    .map(
+      (event) => `
+        <div class="cv-feed-item">
+          <span class="cv-feed-dot"></span>
+          <div><strong>${event.count} ${event.count === 1 ? "person" : "people"}</strong><small>${esc(event.bus)}</small></div>
+          <time>${esc(formatClock(event.at))}</time>
+        </div>`
+    )
+    .join("");
+}
 
 /* ------------------------------------------------------------------ */
 /* Backend data                                                        */
@@ -78,6 +127,7 @@ function populateBusSelect() {
     .map((bus) => `<option value="${esc(bus.id)}"${bus.id === active ? " selected" : ""}>${esc(bus.id)} · ${esc(bus.route)}</option>`)
     .join("");
   select.value = active;
+  renderStatusUi(getState());
 }
 
 function populateCameraDeviceSelect(devices) {
@@ -103,18 +153,18 @@ function populateCameraDeviceSelect(devices) {
 export function renderComputerVision() {
   return `
     <div class="cv-page-container">
-      <!-- Page Heading -->
       <div class="page-heading">
         <div>
+          <div class="page-eyebrow">LIVE COMPUTER VISION</div>
           <h1>Computer Vision Monitoring</h1>
-          <p>Real-time browser camera stream with YOLO person detection and passenger counting.</p>
+          <p>Run real browser-camera person detection with YOLOv8 and publish the count to the conductor workflow.</p>
         </div>
         <div class="heading-actions">
-          <span class="demo-tag">DEMO ENVIRONMENT</span>
+          <span class="status status-normal">Browser inference</span>
+          <span class="demo-tag">LIVE DATA</span>
         </div>
       </div>
 
-      <!-- Top Summary Grid: Single Prominent Counter & Camera Status -->
       <div class="cv-hero-grid">
         <article class="kpi-card cv-people-card">
           <div class="kpi-top">
@@ -146,12 +196,19 @@ export function renderComputerVision() {
           </div>
           <div class="kpi-foot" id="cvModelStatusFoot">YOLO · person class</div>
         </article>
+
+        <article class="kpi-card cv-status-card">
+          <div class="kpi-top">
+            <span class="kpi-label">MONITORED BUS</span>
+            <span class="kpi-icon amber">▣</span>
+          </div>
+          <div class="cv-bus-value" id="cvBusCardValue">—</div>
+          <div class="kpi-foot" id="cvBusCardFoot">Select a registered bus</div>
+        </article>
       </div>
 
-      <!-- Error Notice Banner -->
       <div id="cvErrorBanner" class="cv-error-banner" style="display:none"></div>
 
-      <!-- Unified Camera Controls Bar -->
       <div class="cv-controls-bar">
         <div class="cv-controls-left">
           <button class="btn btn-primary" id="cvStartBtn">
@@ -173,27 +230,70 @@ export function renderComputerVision() {
             <span>Camera</span>
             <select id="cvCameraSelect" class="form-control cv-select-device" aria-label="Camera device"></select>
           </label>
-          <button class="btn" data-goto="Conductor Panel">
+          <button class="btn" id="cvFullscreenBtn" type="button">⛶ Fullscreen</button>
+          <button class="btn btn-primary" data-goto="Conductor Panel">
             🎫 Conductor Panel →
           </button>
         </div>
       </div>
 
-      <!-- Large Live Browser Camera Preview -->
-      <section class="panel cv-preview-panel">
-        <div class="cv-viewport-wrap" id="cvPreviewContainer">
-          <video id="cvVideoElement" class="cv-video" playsinline muted autoplay></video>
-          <canvas id="cvOverlayCanvas" class="cv-canvas"></canvas>
-
-          <div id="cvPlaceholder" class="cv-placeholder">
-            <div class="cv-placeholder-card">
-              <div class="cv-cam-glyph">📷</div>
-              <h3>Browser Camera Off</h3>
-              <p>Click <strong>Allow Camera &amp; Start Monitoring</strong> above to begin real-time YOLO person detection.</p>
+      <div class="cv-live-layout">
+        <section class="panel cv-preview-panel">
+          <div class="panel-heading">
+            <div><h2>Live camera preview</h2><div class="panel-subtitle">Person detections are drawn on the current video frame with temporary tracking IDs.</div></div>
+            <div class="heading-inline">
+              <span class="cv-live-indicator" id="cvLiveIndicator"><i></i>Standby</span>
+              <span class="mini-pill">YOLOv8 · person</span>
             </div>
           </div>
-        </div>
-      </section>
+          <div class="cv-viewport-wrap" id="cvPreviewContainer">
+            <video id="cvVideoElement" class="cv-video" playsinline muted autoplay></video>
+            <canvas id="cvOverlayCanvas" class="cv-canvas"></canvas>
+
+            <div id="cvLiveOverlay" class="cv-live-overlay" style="display:none">
+              <span class="cv-live-pill"><i></i>LIVE</span>
+              <span class="cv-live-count"><strong id="cvOverlayCount">—</strong> people</span>
+            </div>
+
+            <div id="cvPlaceholder" class="cv-placeholder">
+              <div class="cv-placeholder-card">
+                <div class="cv-cam-glyph">📷</div>
+                <h3>Browser Camera Off</h3>
+                <p>Click <strong>Allow Camera &amp; Start Monitoring</strong> above to begin real-time YOLO person detection.</p>
+              </div>
+            </div>
+          </div>
+          <div class="cv-preview-foot">
+            <span>Video stays in this browser except for inference frames sent to the local backend.</span>
+            <span id="cvPreviewSession">No active session</span>
+          </div>
+        </section>
+
+        <aside class="cv-session-column">
+          <section class="panel">
+            <div class="panel-heading"><div><h2>Session summary</h2><div class="panel-subtitle">Live values from the current camera inference session.</div></div></div>
+            <div class="cv-metric-list">
+              <div><span>Peak count</span><strong id="cvPeakCount">—</strong></div>
+              <div><span>Inference latency</span><strong id="cvInferenceLatency">—</strong></div>
+              <div><span>Last detection</span><strong id="cvLastDetection">—</strong></div>
+              <div><span>Session started</span><strong id="cvSessionStarted">—</strong></div>
+              <div><span>Session ID</span><strong class="mono" id="cvSessionId">—</strong></div>
+            </div>
+          </section>
+
+          <section class="panel cv-feed-panel">
+            <div class="panel-heading"><div><h2>Detection feed</h2><div class="panel-subtitle">Recent real count updates from this session.</div></div><span class="mini-pill" id="cvFeedCount">0 events</span></div>
+            <div id="cvDetectionFeed" class="cv-detection-feed">
+              <div class="cv-feed-empty">Detection events will appear after the camera starts.</div>
+            </div>
+          </section>
+
+          <section class="panel cv-privacy-panel">
+            <div class="cv-privacy-icon">ⓘ</div>
+            <div><h2>Operational note</h2><p>Counts are produced from real camera frames and published to the selected bus. Keep the conductor informed and verify any variance manually.</p></div>
+          </section>
+        </aside>
+      </div>
     </div>
   `;
 }
@@ -223,10 +323,32 @@ function renderStatusUi(state) {
   const peopleFootEl = document.getElementById("cvPeopleFoot");
   const cameraFootEl = document.getElementById("cvCameraStatusFoot");
   const modelFootEl = document.getElementById("cvModelStatusFoot");
+  const busCardValue = document.getElementById("cvBusCardValue");
+  const busCardFoot = document.getElementById("cvBusCardFoot");
+  const liveIndicator = document.getElementById("cvLiveIndicator");
+  const liveOverlay = document.getElementById("cvLiveOverlay");
+  const overlayCount = document.getElementById("cvOverlayCount");
+  const previewSession = document.getElementById("cvPreviewSession");
 
   const streaming = state.cameraStatus === CameraStatus.CONNECTED && !!state.stream;
+  if (streaming && !wasStreaming) {
+    resetSessionMetrics();
+    renderDetectionFeed();
+  }
+  wasStreaming = streaming;
 
   if (placeholderEl) placeholderEl.style.display = streaming ? "none" : "flex";
+
+  const activeBus = busForId(state.busId);
+  if (busCardValue) busCardValue.textContent = state.busId || "—";
+  if (busCardFoot) busCardFoot.textContent = activeBus?.route ? `${activeBus.route} · publishes camera count` : "Select a registered bus";
+
+  if (liveIndicator) {
+    liveIndicator.classList.toggle("active", streaming);
+    liveIndicator.innerHTML = `<i></i>${streaming ? "Live inference" : "Standby"}`;
+  }
+  if (liveOverlay) liveOverlay.style.display = streaming ? "flex" : "none";
+  if (previewSession) previewSession.textContent = state.sessionId ? `Session ${state.sessionId}` : "No active session";
 
   if (cameraBadgeEl) {
     const badge = cameraBadge(state);
@@ -270,6 +392,7 @@ function renderStatusUi(state) {
   if (peopleCountEl) {
     peopleCountEl.textContent = hasCount ? String(state.lastCount) : "—";
   }
+  if (overlayCount) overlayCount.textContent = hasCount ? String(state.lastCount) : "—";
 
   if (peopleFootEl) {
     if (!streaming) {
@@ -281,6 +404,32 @@ function renderStatusUi(state) {
       peopleFootEl.textContent = updated ? `Live current-frame count · ${updated}` : "Live current-frame count";
     }
   }
+
+  if (streaming && hasCount) {
+    const detectedCount = Number(state.lastCount);
+    peakCount = Math.max(peakCount, detectedCount);
+    const detectionEpoch = state.lastDetectionAt ? new Date(state.lastDetectionAt).getTime() : NaN;
+    const wallClock = Date.now();
+    const changed = lastLoggedCount !== detectedCount;
+    if (state.lastDetectionAt && Number.isFinite(detectionEpoch) && detectionEpoch !== lastLoggedDetectionAt && (changed || wallClock - lastLogWallClock > 5000)) {
+      detectionLog = [{ count: detectedCount, bus: state.busId || "Selected bus", at: state.lastDetectionAt }, ...detectionLog].slice(0, 8);
+      lastLoggedDetectionAt = detectionEpoch;
+      lastLoggedCount = detectedCount;
+      lastLogWallClock = wallClock;
+      renderDetectionFeed();
+    }
+  }
+
+  const peakEl = document.getElementById("cvPeakCount");
+  const inferenceEl = document.getElementById("cvInferenceLatency");
+  const lastDetectionEl = document.getElementById("cvLastDetection");
+  const sessionStartedEl = document.getElementById("cvSessionStarted");
+  const sessionIdEl = document.getElementById("cvSessionId");
+  if (peakEl) peakEl.textContent = hasCount || peakCount ? String(peakCount) : "—";
+  if (inferenceEl) inferenceEl.textContent = state.lastInferenceMs == null ? "—" : `${Math.round(state.lastInferenceMs)} ms`;
+  if (lastDetectionEl) lastDetectionEl.textContent = hasCount ? formatClock(state.lastDetectionAt) : "—";
+  if (sessionStartedEl) sessionStartedEl.textContent = monitoringStartedAt ? formatClock(monitoringStartedAt) : "—";
+  if (sessionIdEl) sessionIdEl.textContent = state.sessionId || "—";
 
   const isRequesting = state.cameraStatus === CameraStatus.CONNECTING;
   if (startBtn) {
@@ -467,11 +616,11 @@ export function wireComputerVisionControls() {
   checkBackendModelStatus();
   refreshCameraDevices();
   loadRegisteredBuses();
+  renderDetectionFeed();
 
   releaseConsumer = registerConsumer("computer-vision");
   unsubscribe = subscribe(renderStatusUi);
 
-  // Reuse a camera session that is already running (started on the panel)
   if (isCameraActive()) {
     attachVideo(document.getElementById("cvVideoElement"));
   }
@@ -479,6 +628,16 @@ export function wireComputerVisionControls() {
   document.getElementById("cvStartBtn")?.addEventListener("click", () => startCamera(getState().selectedDeviceId));
   document.getElementById("cvStopBtn")?.addEventListener("click", () => stopCamera());
   document.getElementById("cvRestartBtn")?.addEventListener("click", () => restartCamera());
+  document.getElementById("cvFullscreenBtn")?.addEventListener("click", async () => {
+    const container = document.getElementById("cvPreviewContainer");
+    if (!container) return;
+    try {
+      if (document.fullscreenElement) await document.exitFullscreen();
+      else await container.requestFullscreen();
+    } catch (err) {
+      console.warn("Fullscreen is unavailable:", err);
+    }
+  });
 
   document.getElementById("cvCameraSelect")?.addEventListener("change", (e) => {
     const deviceId = e.target.value;
@@ -488,19 +647,23 @@ export function wireComputerVisionControls() {
   });
 
   document.getElementById("cvBusSelect")?.addEventListener("change", (e) => {
+    resetSessionMetrics();
     setActiveBusId(e.target.value);
+    renderDetectionFeed();
     postHeartbeat("bus_selected");
   });
 
-  window.addEventListener("resize", adjustCanvasSize);
+  resizeHandler = () => adjustCanvasSize();
+  window.addEventListener("resize", resizeHandler);
 
-  // Global cleanup hook used by the page router.
   window.__stopVisionMonitoring = () => {
-    // The shared camera session is only released when no other page needs it.
     if (releaseConsumer) releaseConsumer();
     releaseConsumer = null;
     if (unsubscribe) unsubscribe();
     unsubscribe = null;
+    if (resizeHandler) window.removeEventListener("resize", resizeHandler);
+    resizeHandler = null;
+    wasStreaming = false;
     postHeartbeat("page_closed");
   };
 }

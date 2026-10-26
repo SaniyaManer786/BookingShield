@@ -133,6 +133,7 @@ class ConductorPanelApiTests(unittest.TestCase):
         conductor_db.record_latest_detection("MH-14-BT-1906", count=99)
         res = self.submit(
             bus_id="MH-14-BT-1906",
+            route="Pune - Nashik",
             checkpoint="Camera Down",
             camera_available=False,
             camera_estimate=None,
@@ -147,7 +148,11 @@ class ConductorPanelApiTests(unittest.TestCase):
         self.assertIsNone(data["alert"])
 
     def test_07_no_camera_data_ever(self):
-        res = self.submit(bus_id="MH-09-CV-3372", checkpoint="No Camera Bus")
+        res = self.submit(
+            bus_id="MH-09-CV-3372",
+            route="Pune - Kolhapur",
+            checkpoint="No Camera Bus",
+        )
         self.assertEqual(res.status_code, 201)
         data = res.json()
         self.assertIsNone(data["camera_estimate"])
@@ -246,7 +251,11 @@ class ConductorPanelApiTests(unittest.TestCase):
         self.assertGreater(body["age_seconds"], body["stale_after_seconds"])
 
         # Submitting without an explicit snapshot must not attach the stale 30.
-        saved = self.submit(bus_id=bus_id, checkpoint="Stale Camera")
+        saved = self.submit(
+            bus_id=bus_id,
+            route="Pune - Nashik",
+            checkpoint="Stale Camera",
+        )
         self.assertEqual(saved.status_code, 201)
         data = saved.json()
         self.assertIsNone(data["camera_estimate"])
